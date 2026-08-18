@@ -1,0 +1,67 @@
+name: Release CLI Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Compile Binaries
+        run: |
+          # Detect directory structure (monorepo subfolder vs root CLI repo)
+          TARGET_DIR="."
+          if [ -d "cli" ]; then
+            TARGET_DIR="cli"
+          fi
+          
+          echo "Building CLI from directory: $TARGET_DIR"
+          cd $TARGET_DIR
+          
+          # Install dependencies
+          bun install
+          
+          # Compile standalone executables for Windows, Linux, and macOS
+          mkdir -p dist
+          
+          echo "Compiling for Linux x64..."
+          bun build --compile --target=bun-linux-x64 ./src/index.ts --outfile dist/vivacious-linux-x64
+          
+          echo "Compiling for Linux arm64..."
+          bun build --compile --target=bun-linux-arm64 ./src/index.ts --outfile dist/vivacious-linux-arm64
+          
+          echo "Compiling for macOS x64..."
+          bun build --compile --target=bun-darwin-x64 ./src/index.ts --outfile dist/vivacious-macos-x64
+          
+          echo "Compiling for macOS arm64..."
+          bun build --compile --target=bun-darwin-arm64 ./src/index.ts --outfile dist/vivacious-macos-arm64
+          
+          echo "Compiling for Windows x64..."
+          bun build --compile --target=bun-windows-x64 ./src/index.ts --outfile dist/vivacious-windows-x64.exe
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vivacious-linux-x64
+            dist/vivacious-linux-arm64
+            dist/vivacious-macos-x64
+            dist/vivacious-macos-arm64
+            dist/vivacious-windows-x64.exe
+          fail_on_unsupported_partial_path: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
