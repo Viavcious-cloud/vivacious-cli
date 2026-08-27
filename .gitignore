@@ -1,6 +1,4 @@
 node_modules/
+.venv/
 dist/
-.DS_Store
-*.log
-.env
-.vivacious
+*.tar.gz

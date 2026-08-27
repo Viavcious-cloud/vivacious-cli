@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
@@ -57,11 +57,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/vivacious-linux-x64
-            dist/vivacious-linux-arm64
-            dist/vivacious-macos-x64
-            dist/vivacious-macos-arm64
-            dist/vivacious-windows-x64.exe
+            ${{ github.workspace }}/cli/dist/vivacious-linux-x64
+            ${{ github.workspace }}/cli/dist/vivacious-linux-arm64
+            ${{ github.workspace }}/cli/dist/vivacious-macos-x64
+            ${{ github.workspace }}/cli/dist/vivacious-macos-arm64
+            ${{ github.workspace }}/cli/dist/vivacious-windows-x64.exe
+            ${{ github.workspace }}/dist/vivacious-linux-x64
+            ${{ github.workspace }}/dist/vivacious-linux-arm64
+            ${{ github.workspace }}/dist/vivacious-macos-x64
+            ${{ github.workspace }}/dist/vivacious-macos-arm64
+            ${{ github.workspace }}/dist/vivacious-windows-x64.exe
           fail_on_unsupported_partial_path: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
