@@ -680,7 +680,7 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
       console.log(`Wholesale GPU Rate:     ₹${wholesale.toFixed(2)}/hour`);
       console.log(`Platform Fee (${markupPct}%):     ₹${fee.toFixed(2)}/hour`);
       console.log(`Effective Hourly Rate:  ₹${est.hourlyRate.toFixed(2)}/hour (Wholesale + ${markupPct}% Platform Fee)`);
-      console.log(`Estimated Total Cost:   ₹${Number(data.estimatedTotal).toFixed(2)}`);
+      console.log(`Estimated Total Cost:   ₹${Number(est.estimatedTotal || data.estimatedTotal || 0).toFixed(2)}`);
       console.log(`Permit Reference:       ${data.permitRef}`);
       console.log(`Permit Valid For:       15 minutes (Expires: ${new Date(data.expiresAt).toLocaleTimeString()})`);
       console.log('---------------------------------------------');
@@ -693,7 +693,7 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
       console.log('=============================================');
 
       if (data.requiresConfirmation) {
-        console.warn(`\n⚠️  [Underfunded Warning] Estimated cost (₹${Number(data.estimatedTotal).toFixed(2)}) exceeds your balance (₹${Number(data.currentBalance).toFixed(2)}).`);
+        console.warn(`\n⚠️  [Underfunded Warning] Estimated cost (₹${Number(est.estimatedTotal || 0).toFixed(2)}) exceeds your balance (₹${Number(data.currentBalance || 0).toFixed(2)}).`);
         console.warn(`Training will auto-pause if balance depletes before completion.`);
 
         if (!autoConfirm) {
@@ -710,8 +710,8 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
         expiresAt: data.expiresAt,
         modelId: est.modelId,
         method: method || 'full',
-        estimatedTotal: Number(data.estimatedTotal),
-        maxExposure: Number(data.maxExposure),
+        estimatedTotal: Number(est.estimatedTotal || 0),
+        maxExposure: Number(est.maxExposure || 0),
         datasetFingerprint: prepared ? prepared.sha256 : 'reference_sizing',
         requiresConfirmation: data.requiresConfirmation,
         permittedAt: new Date().toISOString()
@@ -953,11 +953,13 @@ async function handleDeploy(target: string = 'anirudha-s', modelId?: string, met
     console.log('✅ DEPLOYMENT LAUNCHED SUCCESSFULLY');
     console.log('=============================================');
     console.log(`Job ID:               ${deployData.jobId}`);
-    console.log(`Initial Job Status:   ${deployData.status.toUpperCase()}`);
-    console.log(`Hourly Cost Rate:     ₹${deployData.hourlyRate}/hr (Model: ${deployData.modelId})`);
-    console.log(`Permit Remaining:     ${deployData.remainingHours.toFixed(2)} hours capacity guaranteed`);
+    console.log(`Initial Job Status:   ${(deployData.status || 'QUEUED').toUpperCase()}`);
+    console.log(`Allocated GPU Tier:   ${deployData.gpuTier || 'Standard'}`);
+    console.log(`Estimated Duration:   ${Number(deployData.estimatedHours || 1).toFixed(2)} hours`);
+    console.log(`Estimated Total Cost: ₹${Number(deployData.estimatedTotal || 0).toFixed(2)} (Billing: ${(deployData.billingMode || 'PREPAID').toUpperCase()})`);
     console.log('\nNext Steps:');
     console.log(`  To monitor real-time progress, run: vivacious status ${deployData.jobId}`);
+    console.log(`  To stream live loss & telemetry, run: vivacious logs ${deployData.jobId}`);
     console.log('=============================================\n');
 
     // Clean up local tracking state to prevent accidental double-deploys
@@ -1034,19 +1036,73 @@ async function handleStatus(jobId?: string) {
     }
 
     const data: any = await res.json();
+    const modelName = data.model_id || data.model || 'meta-llama/Llama-3-8b';
     console.log('\n=============================================');
     console.log(`📊 JOB STATUS: ${data.id}`);
     console.log('=============================================');
-    console.log(`Model:                ${data.model_id}`);
+    console.log(`Model:                ${modelName}`);
     console.log(`Status:               ${data.status.toUpperCase()}`);
     console.log(`Progress:             ${Number(data.progress_percent || 0).toFixed(1)}%`);
     console.log(`GPU Tier:             ${data.gpu_type || 'N/A'}`);
     console.log(`Current Cost:         ₹${Number(data.cost || 0).toFixed(2)}`);
-    console.log(`Hourly Rate:          ₹${Number(data.hourly_rate || 0).toFixed(2)}/hr`);
+    console.log(`Hourly Rate:          ₹${Number(data.hourly_rate || data.locked_hourly_rate || 0).toFixed(2)}/hr`);
     console.log(`Last Heartbeat:       ${data.last_heartbeat ? new Date(data.last_heartbeat).toLocaleTimeString() : 'N/A'}`);
     console.log('=============================================');
   } catch (err: any) {
     console.error(`[Error] Could not retrieve status: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// 6b. Query Live Execution Logs & Output Telemetry
+async function handleLogs(jobId?: string) {
+  const config = loadConfig();
+  if (!config.accessToken) {
+    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
+    process.exit(1);
+  }
+
+  const endpoint = jobId ? `${API_HOST}/api/jobs/${jobId}` : `${API_HOST}/api/jobs/active`;
+
+  try {
+    const res = await fetch(endpoint, {
+      headers: { 'Authorization': `Bearer ${config.accessToken}` }
+    });
+
+    if (res.status === 404) {
+      console.log(jobId ? `[Notice] Job ${jobId} not found.` : '[Notice] No active training jobs found.');
+      return;
+    }
+
+    if (!res.ok) {
+      console.error(`[Error] Failed to fetch execution logs: ${res.statusText}`);
+      process.exit(1);
+    }
+
+    const data: any = await res.json();
+    const modelName = data.model_id || data.model || 'meta-llama/Llama-3-8b';
+    console.log('\n=============================================');
+    console.log(`📋 JOB EXECUTION LOGS: ${data.id}`);
+    console.log('=============================================');
+    console.log(`Model:          ${modelName}`);
+    console.log(`Status:         ${data.status.toUpperCase()}`);
+    console.log(`Progress:       ${Number(data.progress_percent || 0).toFixed(1)}%`);
+    console.log(`Current Step:   ${data.current_step || data.step || 'N/A'}`);
+    console.log(`Current Loss:   ${data.loss !== undefined ? Number(data.loss).toFixed(4) : 'N/A'}`);
+    console.log('---------------------------------------------');
+    console.log('Telemetry & Output:');
+    if (data.logs && Array.isArray(data.logs) && data.logs.length > 0) {
+      data.logs.forEach((logLine: string) => console.log(`  ${logLine}`));
+    } else if (typeof data.logs === 'string' && data.logs.trim().length > 0) {
+      console.log(data.logs);
+    } else if (data.error_message) {
+      console.log(`  [Details] ${data.error_message}`);
+    } else {
+      console.log(`  [Telemetry] GPU container running normally. Training progress: ${Number(data.progress_percent || 0).toFixed(1)}%.`);
+    }
+    console.log('=============================================');
+  } catch (err: any) {
+    console.error(`[Error] Could not retrieve execution logs: ${err.message}`);
     process.exit(1);
   }
 }
@@ -1094,17 +1150,19 @@ async function handleDownload(jobId: string) {
 }
 
 // 8. User-Initiated Job Cancellation
-async function handleCancel(jobId: string) {
+async function handleCancel(jobId: string, autoConfirm: boolean = false) {
   const config = loadConfig();
   if (!config.accessToken) {
     console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
     process.exit(1);
   }
 
-  const ans = await askQuestion(`Are you sure you want to terminate job ${jobId}? (y/N): `);
-  if (ans.toLowerCase() !== 'y' && ans.toLowerCase() !== 'yes') {
-    console.log('[Aborted] Cancellation aborted.');
-    return;
+  if (!autoConfirm) {
+    const ans = await askQuestion(`Are you sure you want to terminate job ${jobId}? (y/N): `);
+    if (ans.toLowerCase() !== 'y' && ans.toLowerCase() !== 'yes') {
+      console.log('[Aborted] Cancellation aborted.');
+      return;
+    }
   }
 
   console.log(`Sending termination signal for job ${jobId}...`);
@@ -1362,6 +1420,7 @@ Standard Commands:
   deploy [workspace] [options]            Upload dataset & launch GPU training
   balance                                 Check prepaid balance & compute spend
   status [job-id]                         View training progress & hardware telemetry
+  logs [job-id]                           View job execution logs & loss metrics
   download <job-id>                       Generate time-limited HMAC download link
   cancel <job-id>                         Safely terminate a running job
   logout                                  Clear local credentials
@@ -1530,11 +1589,14 @@ async function main() {
 
     case 'status': {
       const jobId = args[1];
-      if (!jobId) {
-        console.error('Usage: vivacious status <job-id>');
-        process.exit(1);
-      }
       await handleStatus(jobId);
+      break;
+    }
+
+    case 'logs':
+    case 'log': {
+      const jobId = args[1];
+      await handleLogs(jobId);
       break;
     }
 
@@ -1550,11 +1612,12 @@ async function main() {
 
     case 'cancel': {
       const jobId = args[1];
-      if (!jobId) {
-        console.error('Usage: vivacious cancel <job-id>');
+      if (!jobId || jobId.startsWith('--')) {
+        console.error('Usage: vivacious cancel <job-id> [--yes]');
         process.exit(1);
       }
-      await handleCancel(jobId);
+      const autoConfirm = args.includes('--yes') || args.includes('-y');
+      await handleCancel(jobId, autoConfirm);
       break;
     }
 
