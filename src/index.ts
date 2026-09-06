@@ -12,10 +12,25 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import * as readline from 'readline';
+import * as zlib from 'zlib';
+import * as child_process from 'child_process';
 
-const API_HOST = process.env.VIVACIOUS_API_HOST || 'https://vivacious-orchestrator.vivacious-cloud.workers.dev';
+const API_HOST = process.env.VIVACIOUS_API_HOST || process.env.VIVACIOUS_API_URL || 'https://vivacious-orchestrator.vivacious-cloud.workers.dev';
 const CONFIG_DIR = path.join(os.homedir(), '.vivacious');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+
+function openBrowser(url: string): void {
+  try {
+    const platform = process.platform;
+    if (platform === 'win32') {
+      child_process.exec(`start "" "${url}"`);
+    } else if (platform === 'darwin') {
+      child_process.exec(`open "${url}"`);
+    } else {
+      child_process.exec(`xdg-open "${url}"`);
+    }
+  } catch {}
+}
 
 export interface PreparedDataset {
   path: string;
@@ -71,16 +86,96 @@ export interface ResumeContext {
 
 export interface Config {
   accessToken?: string | undefined;
+  refreshToken?: string | undefined;
+  tokenExpiresAt?: number | undefined;
   preparedDataset?: PreparedDataset | undefined;
   preparedCheckpoint?: PreparedCheckpoint | undefined;
   lastPermit?: LastPermit | undefined;
   resumeContext?: ResumeContext | undefined;
 }
 
+/**
+ * Safely parses the expiration timestamp (in milliseconds) from a JWT without external libraries.
+ */
+export function parseJwtExpiryMs(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64Url = parts[1];
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+    const jsonPayload = decodeURIComponent(
+      Buffer.from(base64, 'base64')
+        .toString('binary')
+        .split('')
+        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    const decoded = JSON.parse(jsonPayload);
+    return typeof decoded.exp === 'number' && Number.isFinite(decoded.exp) ? decoded.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function getValidAccessToken(forceRefresh: boolean = false): Promise<string> {
+  const config = loadConfig();
+  if (!config.accessToken) {
+    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
+    process.exit(1);
+  }
+
+  const now = Date.now();
+  const tokenExp = parseJwtExpiryMs(config.accessToken) || config.tokenExpiresAt || 0;
+  // Trigger proactive refresh if token expires within 120 seconds (or is already expired)
+  const isExpiringSoon = (tokenExp - now) < 120_000;
+
+  if ((isExpiringSoon || forceRefresh) && config.refreshToken) {
+    try {
+      const refreshRes = await fetch(`${API_HOST}/api/auth/token/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: config.refreshToken })
+      });
+
+      if (refreshRes.ok) {
+        const refreshData: any = await refreshRes.json();
+        if (refreshData.access_token) {
+          config.accessToken = refreshData.access_token;
+          if (refreshData.refresh_token) {
+            config.refreshToken = refreshData.refresh_token;
+          }
+          const parsedExp = parseJwtExpiryMs(refreshData.access_token);
+          config.tokenExpiresAt = parsedExp || (Date.now() + (refreshData.expires_in || 3600) * 1000);
+          saveConfig(config);
+          return config.accessToken!;
+        }
+      } else {
+        if (refreshRes.status === 401 || refreshRes.status === 400) {
+          console.warn('[Notice] Session expired. Please re-authenticate via "vivacious login anirudha-s".');
+        }
+      }
+    } catch (refreshErr: any) {
+      console.warn(`[Notice] Temporary network issue during session refresh: ${refreshErr.message || 'Continuing with current credentials...'}`);
+    }
+  }
+
+  // If token is already expired and cannot be refreshed, halt cleanly with guidance
+  if (tokenExp > 0 && tokenExp <= now) {
+    console.error('\n[Notice] Your authentication session has expired.');
+    console.error('Please run "vivacious login anirudha-s" to authenticate.\n');
+    process.exit(1);
+  }
+
+  return config.accessToken!;
+}
+
 function loadConfig(): Config {
   if (!fs.existsSync(CONFIG_FILE)) {
     return {};
   }
+  try {
+    fs.chmodSync(CONFIG_FILE, 0o600);
+  } catch {}
   try {
     const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
     return JSON.parse(raw);
@@ -91,10 +186,14 @@ function loadConfig(): Config {
 
 function saveConfig(config: Config) {
   if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  try {
+    fs.chmodSync(CONFIG_FILE, 0o600);
+  } catch {}
 }
+
 
 function askQuestion(query: string): Promise<string> {
   const rl = readline.createInterface({
@@ -123,23 +222,40 @@ export function calculateFileSha256(filePath: string): Promise<string> {
 }
 
 /**
- * Stream-based directory fingerprint calculation
+ * Stream-based directory fingerprint calculation with constant-memory directory traversal
  */
 export async function calculateDirectoryFingerprint(dirPath: string): Promise<{ totalSize: number; fileCount: number; sha256: string }> {
   const hash = crypto.createHash('sha256');
   let totalSize = 0;
   let fileCount = 0;
 
-  async function walk(currentDir: string) {
-    const files = fs.readdirSync(currentDir).sort();
-    for (const file of files) {
-      const fullPath = path.join(currentDir, file);
-      const stat = fs.statSync(fullPath);
-      if (stat.isDirectory()) {
-        await walk(fullPath);
-      } else {
+  async function walk(currentDir: string, depth: number = 0) {
+    if (depth > 20) {
+      throw new Error(`Directory nesting exceeds maximum depth limit of 20 at "${currentDir}". Recursive directory or symlink loop detected.`);
+    }
+    
+    const dir = await fs.promises.opendir(currentDir);
+    const entryNames: string[] = [];
+    
+    for await (const dirent of dir) {
+      entryNames.push(dirent.name);
+    }
+    entryNames.sort(); // Maintain deterministic lexical sort for cryptographic fingerprinting
+
+    for (const name of entryNames) {
+      const fullPath = path.join(currentDir, name);
+      const lstat = await fs.promises.lstat(fullPath);
+      
+      if (lstat.isSymbolicLink()) {
+        console.warn(`[Notice] Skipping symlink: ${fullPath}`);
+        continue;
+      }
+      
+      if (lstat.isDirectory()) {
+        await walk(fullPath, depth + 1);
+      } else if (lstat.isFile()) {
         fileCount++;
-        totalSize += stat.size;
+        totalSize += lstat.size;
         hash.update(path.relative(dirPath, fullPath));
         await new Promise<void>((resolve, reject) => {
           const stream = fs.createReadStream(fullPath, { highWaterMark: 64 * 1024 });
@@ -151,9 +267,10 @@ export async function calculateDirectoryFingerprint(dirPath: string): Promise<{ 
     }
   }
 
-  await walk(dirPath);
+  await walk(dirPath, 0);
   return { totalSize, fileCount, sha256: hash.digest('hex') };
 }
+
 
 /**
  * Adaptive multipart chunk calculation that guarantees total parts never exceed 8,500
@@ -307,18 +424,30 @@ export async function scanAndValidateCheckpointArchive(archivePath: string): Pro
               return reject(new Error(`Unsupported special file entry (device/fifo) rejected: "${fullPath}"`));
             }
 
+            // POSIX Extended Header Records ('x' for per-file pax header, 'g' for global header)
+            // or Directory entries ('5' or trailing slash) or PaxHeader/ internal metadata paths
+            const isPaxHeader = typeFlag === 'x' || typeFlag === 'g' || fullPath.startsWith('PaxHeader/') || fullPath.includes('/PaxHeader/');
+            const isDirectory = typeFlag === '5' || fullPath.endsWith('/');
+
             // Security Check 4: Semantic Allowlist Validation (No scripts, no legacy pickle binaries)
             const basename = path.basename(fullPath);
-            if (basename && !fullPath.endsWith('/')) {
-              const DANGEROUS_EXTENSIONS = ['.py', '.sh', '.exe', '.so', '.dll', '.elf', '.bat', '.cmd', '.bin', '.pt', '.pth', '.pkl', '.pickle'];
+            if (!isPaxHeader && !isDirectory && basename) {
+              const DANGEROUS_EXTENSIONS = [
+                '.py', '.sh', '.exe', '.so', '.dll', '.elf', '.bat', '.cmd',
+                '.bin', '.pt', '.pth', '.pkl', '.pickle',
+                '.wasm', '.js', '.mjs', '.cjs', '.a', '.lib'
+              ];
               const ext = path.extname(basename).toLowerCase();
-              if (DANGEROUS_EXTENSIONS.includes(ext)) {
+              const isVersionedSo = /\.so(\.[0-9]+)+$/i.test(basename);
+
+              if (DANGEROUS_EXTENSIONS.includes(ext) || isVersionedSo) {
                 decompressStream.destroy();
                 if (['.bin', '.pt', '.pth', '.pkl', '.pickle'].includes(ext)) {
                   return reject(new Error(`Legacy Python pickle weight file "${basename}" rejected. Model weights must be formatted as safe zero-code .safetensors.`));
                 }
-                return reject(new Error(`Executable or script binary "${basename}" is strictly forbidden in model archives.`));
+                return reject(new Error(`Executable, library, or script binary "${basename}" is strictly forbidden in model archives.`));
               }
+
 
               const ALLOWED_EXACT_FILES = new Set([
                 'config.json',
@@ -406,11 +535,29 @@ export async function scanAndValidateCheckpointArchive(archivePath: string): Pro
     return { isValid: false, error: `Defensive archive scan rejected: ${scanErr.message}` };
   }
 
+function checkJsonNestingDepth(jsonString: string, maxDepth: number = 30): boolean {
+  let depth = 0;
+  for (let i = 0; i < jsonString.length; i++) {
+    const ch = jsonString[i];
+    if (ch === '{' || ch === '[') {
+      depth++;
+      if (depth > maxDepth) return false;
+    } else if (ch === '}' || ch === ']') {
+      depth--;
+    }
+  }
+  return true;
+}
+
   let modelConfig: any = null;
   if (extractedConfigBuffer !== null) {
     try {
       const rawText = (extractedConfigBuffer as Buffer).toString('utf-8');
+      if (!checkJsonNestingDepth(rawText, 30)) {
+        return { isValid: false, error: 'Defensive archive scan rejected: config.json exceeds maximum structural nesting depth (30).' };
+      }
       const parsed = JSON.parse(rawText);
+
       modelConfig = {
         modelType: parsed.model_type || 'custom_causal_lm',
         hiddenSize: parsed.hidden_size || parsed.d_model || 4096,
@@ -467,13 +614,21 @@ async function handleLogin(target: string = 'anirudha-s') {
     const data: any = await response.json();
     const { device_code, user_code, verification_uri, expires_in, interval } = data;
 
+    // Automatic browser opening for zero-friction login
+    openBrowser(verification_uri);
+
+    // Hyperlink with OSC 8 escape sequence for single-click in supported modern terminals
+    const clickableUri = `\u001b]8;;${verification_uri}\u001b\\${verification_uri}\u001b]8;;\u001b\\`;
+
     console.log('\n=============================================');
-    console.log('🔐 VIVACIOUS CLOUD DEVICE LOGIN');
+    console.log('🔐 VIVACIOUS CLOUD — DEVICE LOGIN');
+    console.log('   An Anirudha\'s Ambition');
     console.log('=============================================');
-    console.log(`1. Open this URL in your browser:`);
-    console.log(`   ${verification_uri}`);
-    console.log(`\n2. Enter this one-time code:`);
-    console.log(`   ${user_code}`);
+    console.log('Opening authorization page in your browser automatically...\n');
+    console.log('If your browser did not open, click or copy & paste this URL:');
+    console.log(`👉 ${clickableUri}`);
+    console.log('\nOne-Time Authorization Code:');
+    console.log(`🔑 ${user_code}`);
     console.log('=============================================');
     console.log(`Waiting for browser authorization (polling every ${interval || 5}s)...`);
 
@@ -490,10 +645,15 @@ async function handleLogin(target: string = 'anirudha-s') {
           body: JSON.stringify({ device_code })
         });
 
-        if (tokenRes.status === 200) {
+        if (tokenRes.ok) {
           const tokenData: any = await tokenRes.json();
           const config = loadConfig();
           config.accessToken = tokenData.access_token;
+          if (tokenData.refresh_token) {
+            config.refreshToken = tokenData.refresh_token;
+          }
+          const parsedExp = parseJwtExpiryMs(tokenData.access_token);
+          config.tokenExpiresAt = parsedExp || (Date.now() + (tokenData.expires_in || 3600) * 1000);
           saveConfig(config);
 
           console.log('\n[Success] Logged in successfully! Credentials saved locally.');
@@ -504,7 +664,7 @@ async function handleLogin(target: string = 'anirudha-s') {
         if (errData.error === 'authorization_pending') {
           continue;
         } else if (errData.error === 'expired_token') {
-          console.error('\n[Error] Login attempt expired. Please run "vivacious login anirudha-s" again.');
+          console.error('\n[Error] Login attempt expired. Please run "vivacious login" again.');
           process.exit(1);
         } else {
           console.error(`\n[Error] Login failed: ${errData.error}`);
@@ -615,11 +775,8 @@ async function handlePrepare(inputPath: string, type: 'dataset' | 'checkpoint' =
 
 // 3. Pre-Flight Financial Permit Check (NO R2 Upload, NO GPU Start)
 async function handlePermit(modelId?: string, method: string = 'full', autoConfirm: boolean = false): Promise<boolean> {
+  const accessToken = await getValidAccessToken();
   const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
 
   const prepared = config.preparedDataset;
   if (!prepared && modelId) {
@@ -644,7 +801,7 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify(payload)
     });
@@ -668,24 +825,25 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
 
     if (data.estimate) {
       const est = data.estimate;
-      const wholesale = Number(est.wholesaleHourlyRate || (est.hourlyRate / 1.3));
-      const fee = Number(est.platformFeePerHour || (est.hourlyRate - wholesale));
-      const markupPct = est.platformMarkupPercent || 30;
 
       console.log('---------------------------------------------');
       console.log(`Target Model:           ${est.modelId}`);
       console.log(`Training Method:        ${method.toUpperCase()}`);
       console.log(`Allocated GPU Tier:     ${est.gpuTier}`);
       console.log(`Estimated Duration:     ${est.estimatedHours} hours`);
-      console.log(`Wholesale GPU Rate:     ₹${wholesale.toFixed(2)}/hour`);
-      console.log(`Platform Fee (${markupPct}%):     ₹${fee.toFixed(2)}/hour`);
-      console.log(`Effective Hourly Rate:  ₹${est.hourlyRate.toFixed(2)}/hour (Wholesale + ${markupPct}% Platform Fee)`);
+      console.log(`Effective Hourly Rate:  ₹${est.hourlyRate.toFixed(2)}/hour`);
       console.log(`Estimated Total Cost:   ₹${Number(est.estimatedTotal || data.estimatedTotal || 0).toFixed(2)}`);
       console.log(`Permit Reference:       ${data.permitRef}`);
       console.log(`Permit Valid For:       15 minutes (Expires: ${new Date(data.expiresAt).toLocaleTimeString()})`);
+      if (est.sizingConfidence === 'fallback_default' || est.confidence === 'fallback_default' || est.isFallbackSizing) {
+        console.log('---------------------------------------------');
+        console.warn('⚠️  [Sizing Fallback Notice]:');
+        console.warn(' • Precise model architecture parameters could not be resolved from Hugging Face config.');
+        console.warn(' • Sizing was estimated using a 7B fallback baseline (GPU: ' + est.gpuTier + ').');
+        console.warn(' • If deploying a larger model (e.g. 13B/70B), please specify GPU tier manually to prevent OOM.');
+      }
       console.log('---------------------------------------------');
       console.log('🛡️  PRICING & SPOT MARKET GOVERNANCE NOTICE:');
-      console.log(' • Wholesale Rates: Figures reflect authoritative wholesale cloud GPU broker spot rates.');
       console.log(' • Cost Estimate: Quoted total is an analytical estimate based on token count and model shape.');
       console.log(' • 10% Surge Protection: Broker rates fluctuate dynamically. Upon deployment, your rate is locked.');
       console.log('   If provider spot prices surge >10% mid-run, our policy automatically triggers a Safe Stop/Auto-Migration');
@@ -727,101 +885,213 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
   }
 }
 
+function createTarHeader(filename: string, size: number, mtime: number = Date.now()): Buffer {
+  const header = Buffer.alloc(512);
+  const nameBuf = Buffer.from(filename.replace(/\\/g, '/'), 'utf-8');
+  nameBuf.copy(header, 0, 0, Math.min(100, nameBuf.length));
+  
+  header.write('0000644\0', 100, 8, 'utf-8');
+  header.write('0000000\0', 108, 8, 'utf-8');
+  header.write('0000000\0', 116, 8, 'utf-8');
+  header.write(size.toString(8).padStart(11, '0') + '\0', 124, 12, 'utf-8');
+  header.write(Math.floor(mtime / 1000).toString(8).padStart(11, '0') + '\0', 136, 12, 'utf-8');
+  header.fill(32, 148, 156);
+  header.write('0', 156, 1, 'utf-8');
+  header.write('ustar\0', 257, 6, 'utf-8');
+  header.write('00', 263, 2, 'utf-8');
+
+  let chksum = 0;
+  for (let i = 0; i < 512; i++) chksum += header[i];
+  header.write(chksum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'utf-8');
+
+  return header;
+}
+
+async function verifyAvailableDiskSpace(targetDir: string, estimatedBytes: number): Promise<void> {
+  try {
+    if (typeof (fs as any).statfsSync === 'function') {
+      const stats = (fs as any).statfsSync(targetDir);
+      const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+      const requiredBytes = Math.max(100 * 1024 * 1024, estimatedBytes * 1.5);
+      if (freeBytes > 0 && freeBytes < requiredBytes) {
+        throw new Error(
+          `Insufficient disk space in temporary directory (${targetDir}). ` +
+          `Available: ${(freeBytes / (1024 * 1024)).toFixed(1)} MB, ` +
+          `Required: ${(requiredBytes / (1024 * 1024)).toFixed(1)} MB. ` +
+          `Please free up disk space before packaging dataset.`
+        );
+      }
+    }
+  } catch (err: any) {
+    if (err.message.includes('Insufficient disk space')) {
+      throw err;
+    }
+  }
+}
+
+async function archiveDirectoryToTarGz(dirPath: string, outputPath: string): Promise<number> {
+  const tmpDir = path.dirname(outputPath);
+  await verifyAvailableDiskSpace(tmpDir, 50 * 1024 * 1024);
+  const gzip = zlib.createGzip({ level: 6 });
+  const outStream = fs.createWriteStream(outputPath);
+  gzip.pipe(outStream);
+
+  async function pipeFileChunks(filePath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const readStream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
+      readStream.on('data', (chunk) => {
+        const canContinue = gzip.write(chunk);
+        if (!canContinue) {
+          readStream.pause();
+          gzip.once('drain', () => readStream.resume());
+        }
+      });
+      readStream.on('end', () => resolve());
+      readStream.on('error', (err) => reject(err));
+    });
+  }
+
+  async function walkAndWrite(currentPath: string, relativePrefix: string = ''): Promise<void> {
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      const relPath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        await walkAndWrite(fullPath, relPath);
+      } else if (entry.isFile()) {
+        const stat = fs.statSync(fullPath);
+        const header = createTarHeader(relPath, stat.size, stat.mtimeMs);
+        gzip.write(header);
+        await pipeFileChunks(fullPath);
+        const padding = (512 - (stat.size % 512)) % 512;
+        if (padding > 0) {
+          gzip.write(Buffer.alloc(padding));
+        }
+      }
+    }
+  }
+
+  await walkAndWrite(dirPath);
+  gzip.write(Buffer.alloc(1024)); // Two 512-byte EOF zero blocks
+  gzip.end();
+
+  await new Promise<void>((resolve, reject) => {
+    outStream.on('finish', () => resolve());
+    outStream.on('error', (err) => reject(err));
+    gzip.on('error', (err) => reject(err));
+  });
+
+  return fs.statSync(outputPath).size;
+}
+
 // 4. Server-Authoritative Deployment with Resilient Multipart Upload
-async function performUpload(config: any, prepared: any, fileLabel: string, jobId?: string): Promise<{uploadKey: string, jobId: string}> {
+async function performUpload(_config: any, prepared: any, fileLabel: string, jobId?: string): Promise<{uploadKey: string, jobId: string}> {
+  const accessToken = await getValidAccessToken();
   console.log("Initiating secure clamped multipart upload for " + fileLabel + " to Cloudflare R2...");
   let uploadId = "";
   let uploadKey = "";
   let finalJobId = jobId || "";
+  let uploadFilePath = prepared.path;
+  let uploadFileSizeBytes = prepared.sizeBytes;
+  let isTempArchive = false;
 
   try {
+    if (fs.statSync(prepared.path).isDirectory()) {
+      console.log(`Packaging directory ${prepared.filename} into compressed tarball for upload...`);
+      const tempArchive = path.join(os.tmpdir(), `vivacious_upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.tar.gz`);
+      uploadFileSizeBytes = await archiveDirectoryToTarGz(prepared.path, tempArchive);
+      uploadFilePath = tempArchive;
+      isTempArchive = true;
+    }
+
+    const bodyPayload: any = { filename: prepared.filename };
+    if (finalJobId && finalJobId.trim()) {
+      bodyPayload.jobId = finalJobId.trim();
+    }
+
     const initRes = await fetch(`${API_HOST}/api/upload/initiate`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.accessToken}`
+        "Authorization": `Bearer ${accessToken}`
       },
-      body: JSON.stringify({ filename: prepared.filename, jobId: finalJobId })
+      body: JSON.stringify(bodyPayload)
     });
 
     if (!initRes.ok) {
-      const err = await initRes.json() as any;
-      throw new Error(`Upload initiation failed: ${err.error || initRes.statusText}`);
+      const err = await initRes.json().catch(() => ({})) as any;
+      const errMsg = typeof err.error === 'string' ? err.error : (err.message || (Array.isArray(err.error) ? err.error.map((e: any) => e.message || e).join(', ') : JSON.stringify(err.error || err)));
+      throw new Error(`Upload initiation failed: ${errMsg || initRes.statusText}`);
     }
 
     const initData = await initRes.json() as any;
     uploadId = initData.uploadId;
     uploadKey = initData.key;
     finalJobId = initData.jobId;
+    const uploadToken = initData.uploadToken;
 
-    const chunkSize = calculateAdaptiveChunkSize(prepared.sizeBytes);
-    const totalParts = Math.max(1, Math.ceil(prepared.sizeBytes / chunkSize));
+    const chunkSize = calculateAdaptiveChunkSize(uploadFileSizeBytes);
+    const totalParts = Math.max(1, Math.ceil(uploadFileSizeBytes / chunkSize));
     console.log(`Uploading ${fileLabel} across ${totalParts} adaptive multipart chunk(s) (${(chunkSize / (1024 * 1024)).toFixed(0)} MB/part)...`);
 
     const parts: { ETag: string; PartNumber: number }[] = [];
 
-    if (fs.statSync(prepared.path).isFile()) {
-      const fd = fs.openSync(prepared.path, "r");
-      for (let partNum = 1; partNum <= totalParts; partNum++) {
-        const start = (partNum - 1) * chunkSize;
-        const end = Math.min(prepared.sizeBytes, partNum * chunkSize);
-        const chunkLen = end - start;
-        const buffer = Buffer.alloc(chunkLen);
-        fs.readSync(fd, buffer, 0, chunkLen, start);
+    const fd = fs.openSync(uploadFilePath, "r");
+    for (let partNum = 1; partNum <= totalParts; partNum++) {
+      const start = (partNum - 1) * chunkSize;
+      const end = Math.min(uploadFileSizeBytes, partNum * chunkSize);
+      const chunkLen = end - start;
+      const buffer = Buffer.alloc(chunkLen);
+      fs.readSync(fd, buffer, 0, chunkLen, start);
 
-        let partUploaded = false;
-        let lastErr = "";
+      let partUploaded = false;
+      let lastErr = "";
 
-        for (let attempt = 1; attempt <= 5; attempt++) {
-          try {
-            const partRes = await fetch(`${API_HOST}/api/upload/part`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${config.accessToken}`
-              },
-              body: JSON.stringify({ uploadId, key: uploadKey, partNumber: partNum })
-            });
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          const partRes = await fetch(`${API_HOST}/api/upload/part`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${accessToken}`,
+              ...(uploadToken ? { "x-upload-token": uploadToken } : {})
+            },
+            body: JSON.stringify({ uploadId, key: uploadKey, partNumber: partNum, uploadToken })
+          });
 
-            if (!partRes.ok) throw new Error(`Signed URL request failed: ${partRes.status}`);
+          if (!partRes.ok) throw new Error(`Signed URL request failed: ${partRes.status}`);
 
-            const { url } = await partRes.json() as any;
-            console.log(`[Upload ${fileLabel}] Part ${partNum}/${totalParts} (${(chunkLen / (1024 * 1024)).toFixed(2)} MB, attempt ${attempt})...`);
+          const { url } = await partRes.json() as any;
+          console.log(`[Upload ${fileLabel}] Part ${partNum}/${totalParts} (${(chunkLen / (1024 * 1024)).toFixed(2)} MB, attempt ${attempt})...`);
 
-            let etag = `etag-${partNum}`;
-            if (!url.includes("r2.vivaciouscloud.com") && !url.includes("stub_part_token")) {
-              const putRes = await fetch(url, { method: "PUT", body: buffer });
-              if (!putRes.ok) throw new Error(`R2 gateway returned HTTP ${putRes.status}`);
-              etag = putRes.headers.get("ETag") || etag;
-            }
-
-            parts.push({ ETag: etag, PartNumber: partNum });
-            partUploaded = true;
-            break;
-          } catch (err: any) {
-            lastErr = err.message;
-            const waitMs = Math.min(10000, 1000 * Math.pow(2, attempt));
-            console.warn(`[Upload Retry] Part ${partNum} failed (attempt ${attempt}/5: ${lastErr}). Retrying in ${waitMs / 1000}s...`);
-            await new Promise((r) => setTimeout(r, waitMs));
-          }
-        }
-
-        if (!partUploaded) {
-          throw new Error(`Part ${partNum} permanently failed after 5 retry attempts: ${lastErr}`);
+          const putRes = await fetch(url, { method: "PUT", body: buffer });
+          if (!putRes.ok) throw new Error(`R2 gateway returned HTTP ${putRes.status}`);
+          const etag = putRes.headers.get("ETag") || `etag-${partNum}`;
+          parts.push({ ETag: etag, PartNumber: partNum });
+          partUploaded = true;
+          break;
+        } catch (err: any) {
+          lastErr = err.message;
+          const waitMs = Math.min(10000, 1000 * Math.pow(2, attempt));
+          console.warn(`[Upload Retry] Part ${partNum} failed (attempt ${attempt}/5: ${lastErr}). Retrying in ${waitMs / 1000}s...`);
+          await new Promise((r) => setTimeout(r, waitMs));
         }
       }
-      fs.closeSync(fd);
-    } else {
-      parts.push({ ETag: "dir-complete-etag", PartNumber: 1 });
+
+      if (!partUploaded) {
+        throw new Error(`Part ${partNum} permanently failed after 5 retry attempts: ${lastErr}`);
+      }
     }
+    fs.closeSync(fd);
 
     const completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${config.accessToken}`
+        "Authorization": `Bearer ${accessToken}`,
+        ...(uploadToken ? { "x-upload-token": uploadToken } : {})
       },
-      body: JSON.stringify({ uploadId, key: uploadKey, parts })
+      body: JSON.stringify({ uploadId, key: uploadKey, parts, uploadToken })
     });
 
     if (!completeRes.ok) {
@@ -834,23 +1104,33 @@ async function performUpload(config: any, prepared: any, fileLabel: string, jobI
     console.error(`\n[Upload Failed] ${uploadErr.message}`);
     if (uploadId && uploadKey) {
       try {
+        console.warn(`[Upload Cleanup] Aborting incomplete multipart upload ${uploadId} for key ${uploadKey}...`);
         await fetch(`${API_HOST}/api/upload/abort`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${config.accessToken}` },
-          body: JSON.stringify({ uploadId, key: uploadKey })
+          headers: { 
+             "Content-Type": "application/json", 
+             "Authorization": `Bearer ${accessToken}`
+          },
+          body: JSON.stringify({ uploadId, key: uploadKey, jobId: finalJobId })
         });
-      } catch { /* abort call is best-effort — original uploadErr is re-thrown below regardless */ }
+        console.warn(`[Upload Cleanup] Incomplete multipart upload successfully aborted.`);
+      } catch (abortErr: any) {
+        console.warn(`[Upload Cleanup Warning] Could not reach abort endpoint: ${abortErr.message}`);
+      }
     }
     throw uploadErr;
+  } finally {
+    if (isTempArchive && fs.existsSync(uploadFilePath)) {
+      try {
+        fs.unlinkSync(uploadFilePath);
+      } catch { /* cleanup is best effort */ }
+    }
   }
 }
 
 async function handleDeploy(target: string = 'anirudha-s', modelId?: string, method: string = 'full', autoConfirm: boolean = false, checkpointPath?: string) {
+  const accessToken = await getValidAccessToken();
   let config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
 
   const prepared = config.preparedDataset;
   if (!prepared) {
@@ -894,6 +1174,38 @@ async function handleDeploy(target: string = 'anirudha-s', modelId?: string, met
   const activePermit = config.lastPermit!;
   const prepCheckpoint = config.preparedCheckpoint;
 
+  // Pre-flight balance check: Prevent R2 uploads and bandwidth costs if balance is insufficient
+  try {
+    const balRes = await fetch(`${API_HOST}/api/user/balance`, {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+    if (balRes.ok) {
+      const balData: any = await balRes.json();
+      const currentBalance = Number(balData.currentBalance ?? balData.current_balance ?? 0);
+      const isCard = balData.billingMode === 'card' || balData.billing_mode === 'card';
+      const estimatedCost = Number(activePermit.estimatedTotal || 0);
+
+      if (!isCard && currentBalance <= 0) {
+        console.error('\n=============================================');
+        console.error('❌ [DEPLOYMENT BLOCKED — INSUFFICIENT BALANCE]');
+        console.error('=============================================');
+        console.error(`Current Balance:      ₹${currentBalance.toFixed(2)}`);
+        console.error(`Estimated Run Cost:   ₹${estimatedCost.toFixed(2)}`);
+        console.error('Upload to Cloudflare R2 was stopped to protect your account.');
+        console.error('Please recharge your balance via the Dashboard (Billing) before deploying.');
+        console.error('=============================================');
+        process.exit(1);
+      }
+
+      if (!isCard && currentBalance < estimatedCost && !activePermit.requiresConfirmation) {
+        console.warn(`\n⚠️  [Notice] Current balance (₹${currentBalance.toFixed(2)}) is lower than estimated cost (₹${estimatedCost.toFixed(2)}).`);
+        console.warn('Job may auto-pause if balance depletes during training.');
+      }
+    }
+  } catch {
+    // Non-blocking fallback; server /api/upload/initiate and /api/deploy strictly enforce financial ceilings
+  }
+
   console.log(`\n=============================================`);
   console.log(`🚀 VIVACIOUS CLOUD — JOB DEPLOYMENT`);
   console.log(`=============================================`);
@@ -928,13 +1240,15 @@ async function handleDeploy(target: string = 'anirudha-s', modelId?: string, met
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify({
+        jobId: activeJobId,
         modelId: activePermit.modelId,
         modelSource: checkpointKey ? 'custom_checkpoint' : 'hf',
         checkpointKey: checkpointKey,
         method: activePermit.method,
+        datasetFilename: prepared!.filename,
         datasetSizeBytes: prepared!.sizeBytes,
         datasetFingerprint: prepared!.sha256,
         permitRef: activePermit.permitRef,
@@ -978,19 +1292,21 @@ async function handleDeploy(target: string = 'anirudha-s', modelId?: string, met
 
 // 5. Query Real-Time Balance
 async function handleBalance() {
-  const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
+  const accessToken = await getValidAccessToken();
 
   try {
     const res = await fetch(`${API_HOST}/api/user/balance`, {
-      headers: { 'Authorization': `Bearer ${config.accessToken}` }
+      headers: { 'Authorization': `Bearer ${accessToken}` }
     });
 
     if (!res.ok) {
-      console.error(`[Error] Failed to fetch balance: ${res.statusText}`);
+      if (res.status === 401) {
+        console.error('\n[Notice] Your authentication session has expired.');
+        console.error('Please run "vivacious login anirudha-s" to authenticate.\n');
+        process.exit(1);
+      }
+      const errJson: any = await res.json().catch(() => ({}));
+      console.error(`[Error] Failed to fetch balance: ${errJson.error || res.statusText}`);
       process.exit(1);
     }
 
@@ -998,11 +1314,11 @@ async function handleBalance() {
     console.log('\n=============================================');
     console.log('💰 VIVACIOUS CLOUD — ACCOUNT BALANCE');
     console.log('=============================================');
-    console.log(`User ID:              ${data.userId}`);
-    console.log(`Available Balance:    ₹${Number(data.currentBalance).toFixed(2)}`);
-    console.log(`Total Paid:           ₹${Number(data.totalPaid).toFixed(2)}`);
-    console.log(`Total Spent:          ₹${Number(data.totalSpent).toFixed(2)}`);
-    console.log(`Billing Mode:         ${(data.billingMode || 'PREPAID').toUpperCase()}`);
+    console.log(`User ID:              ${data.userId || data.user_id || 'N/A'}`);
+    console.log(`Available Balance:    ₹${Number(data.currentBalance ?? data.current_balance ?? 0).toFixed(2)}`);
+    console.log(`Total Paid:           ₹${Number(data.totalPaid ?? data.total_paid ?? 0).toFixed(2)}`);
+    console.log(`Total Spent:          ₹${Number(data.totalSpent ?? data.total_spent ?? 0).toFixed(2)}`);
+    console.log(`Billing Mode:         ${(data.billingMode || data.billing_mode || 'PREPAID').toUpperCase()}`);
     console.log('=============================================');
   } catch (err: any) {
     console.error(`[Error] Could not retrieve balance: ${err.message}`);
@@ -1012,17 +1328,13 @@ async function handleBalance() {
 
 // 6. Query Job Status & Live Telemetry
 async function handleStatus(jobId?: string) {
-  const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
+  const accessToken = await getValidAccessToken();
 
   const endpoint = jobId ? `${API_HOST}/api/jobs/${jobId}` : `${API_HOST}/api/jobs/active`;
 
   try {
     const res = await fetch(endpoint, {
-      headers: { 'Authorization': `Bearer ${config.accessToken}` }
+      headers: { 'Authorization': `Bearer ${accessToken}` }
     });
 
     if (res.status === 404) {
@@ -1056,17 +1368,13 @@ async function handleStatus(jobId?: string) {
 
 // 6b. Query Live Execution Logs & Output Telemetry
 async function handleLogs(jobId?: string) {
-  const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
+  const accessToken = await getValidAccessToken();
 
   const endpoint = jobId ? `${API_HOST}/api/jobs/${jobId}` : `${API_HOST}/api/jobs/active`;
 
   try {
     const res = await fetch(endpoint, {
-      headers: { 'Authorization': `Bearer ${config.accessToken}` }
+      headers: { 'Authorization': `Bearer ${accessToken}` }
     });
 
     if (res.status === 404) {
@@ -1107,13 +1415,9 @@ async function handleLogs(jobId?: string) {
   }
 }
 
-// 7. Secure Presigned Download Link Generator
-async function handleDownload(jobId: string) {
-  const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
+// 7. Secure Presigned Download Link Generator & Stream Downloader
+async function handleDownload(jobId: string, directDownload: boolean = true) {
+  const accessToken = await getValidAccessToken();
 
   console.log(`Requesting secure download link for job ${jobId}...`);
 
@@ -1122,7 +1426,7 @@ async function handleDownload(jobId: string) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify({ jobId })
     });
@@ -1138,11 +1442,47 @@ async function handleDownload(jobId: string) {
     console.log('=============================================');
     console.log(`Job ID:       ${jobId}`);
     console.log(`Download URL: ${data.downloadUrl}`);
-    console.log(`Valid For:    ${data.validForMinutes || 60} minutes`);
+    console.log(`Expires At:   ${data.expiresAt || '7 days'}`);
     console.log('---------------------------------------------');
     console.log('Download via cURL:');
     console.log(`  curl -O "${data.downloadUrl}"`);
     console.log('=============================================');
+
+    if (directDownload) {
+      const sanitizedJobId = jobId.replace(/[^a-zA-Z0-9_-]/g, '');
+      const outPath = path.resolve(process.cwd(), `model_weights_${sanitizedJobId}.tar.gz`);
+      console.log(`\nInitiating direct streaming download to: ${outPath}...`);
+      
+      const dlRes = await fetch(data.downloadUrl);
+      if (!dlRes.ok) {
+        console.error(`[Download Error] Storage gateway returned HTTP ${dlRes.status}`);
+        return;
+      }
+
+      const totalLength = Number(dlRes.headers.get('content-length')) || 0;
+      const fileStream = fs.createWriteStream(outPath);
+
+      if (dlRes.body) {
+        let downloadedBytes = 0;
+        const reader = (dlRes.body as any).getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            fileStream.write(Buffer.from(value));
+            downloadedBytes += value.length;
+            if (totalLength > 0) {
+              const pct = ((downloadedBytes / totalLength) * 100).toFixed(1);
+              process.stdout.write(`\rDownloading: ${pct}% (${(downloadedBytes / (1024 * 1024)).toFixed(2)} / ${(totalLength / (1024 * 1024)).toFixed(2)} MB)`);
+            } else {
+              process.stdout.write(`\rDownloading: ${(downloadedBytes / (1024 * 1024)).toFixed(2)} MB`);
+            }
+          }
+        }
+        fileStream.end();
+        console.log(`\n✅ Model weights successfully downloaded: ${outPath}`);
+      }
+    }
   } catch (err: any) {
     console.error(`[Error] Failed to get download link: ${err.message}`);
     process.exit(1);
@@ -1151,11 +1491,7 @@ async function handleDownload(jobId: string) {
 
 // 8. User-Initiated Job Cancellation
 async function handleCancel(jobId: string, autoConfirm: boolean = false) {
-  const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
+  const accessToken = await getValidAccessToken();
 
   if (!autoConfirm) {
     const ans = await askQuestion(`Are you sure you want to terminate job ${jobId}? (y/N): `);
@@ -1172,7 +1508,7 @@ async function handleCancel(jobId: string, autoConfirm: boolean = false) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify({ jobId })
     });
@@ -1193,11 +1529,8 @@ async function handleCancel(jobId: string, autoConfirm: boolean = false) {
 // 9. Checkpoint Resumption Handlers (Dedicated Isolated Workflow)
 
 async function handleResumeInspect(jobId: string) {
+  const accessToken = await getValidAccessToken();
   const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
 
   if (!jobId || jobId === 'begin') {
     console.error('[Error] Missing required parameter: <job-id>');
@@ -1213,7 +1546,7 @@ async function handleResumeInspect(jobId: string) {
 
   try {
     const res = await fetch(`${API_HOST}/api/jobs/resume/inspect?jobId=${encodeURIComponent(jobId)}`, {
-      headers: { 'Authorization': `Bearer ${config.accessToken}` }
+      headers: { 'Authorization': `Bearer ${accessToken}` }
     });
 
     const data: any = await res.json();
@@ -1256,11 +1589,8 @@ async function handleResumeInspect(jobId: string) {
 }
 
 async function handleResumeCheck() {
+  const accessToken = await getValidAccessToken();
   let config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
 
   const resume = config.resumeContext;
   if (!resume || !resume.jobId || !resume.resumeAttemptId) {
@@ -1281,7 +1611,7 @@ async function handleResumeCheck() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify({
         jobId: resume.jobId,
@@ -1326,11 +1656,8 @@ async function handleResumeCheck() {
 }
 
 async function handleResumeBegin(autoConfirm: boolean = false) {
+  const accessToken = await getValidAccessToken();
   const config = loadConfig();
-  if (!config.accessToken) {
-    console.error('[Error] You are not logged in. Please run "vivacious login anirudha-s" first.');
-    process.exit(1);
-  }
 
   const resume = config.resumeContext;
   if (!resume || !resume.jobId || !resume.lastPermitRef) {
@@ -1365,7 +1692,7 @@ async function handleResumeBegin(autoConfirm: boolean = false) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.accessToken}`
+        'Authorization': `Bearer ${accessToken}`
       },
       body: JSON.stringify({
         jobId: resume.jobId,
@@ -1409,32 +1736,50 @@ function handleLogout() {
 function showHelp() {
   console.log(`
 Vivacious Cloud CLI — Production Client
+An Anirudha's Ambition
 
 Usage:
   vivacious <command> [arguments] [options]
 
-Standard Commands:
-  login [workspace]                       Authenticate using browser device code flow
-  prepare [dataset|checkpoint] <path>     Inspect & compute streaming SHA-256 manifest
-  permit [workspace] [options]            Pre-flight financial check & multi-GPU pricing
-  deploy [workspace] [options]            Upload dataset & launch GPU training
-  balance                                 Check prepaid balance & compute spend
-  status [job-id]                         View training progress & hardware telemetry
-  logs [job-id]                           View job execution logs & loss metrics
-  download <job-id>                       Generate time-limited HMAC download link
-  cancel <job-id>                         Safely terminate a running job
-  logout                                  Clear local credentials
+Workflow 1: Open-Source Base Models
+  vivacious login anirudha-s
+  vivacious prepare <path>
+  vivacious permit anirudha-s ambition --model <model-id>
+  vivacious permit anirudha-s ambition --model <model-id> --method lora
+  vivacious permit anirudha-s ambition --model <model-id> --method qlora
+  vivacious deploy anirudha-s
+  vivacious balance
+  vivacious download <job-id>
 
-Resumption Commands (Interrupted Workloads):
-  resume <job-id>                         Inspect stopped job & verify 7-day R2 checkpoint
-  anirudha-s check                        Pre-flight financial check for remaining compute
-  resume begin [--yes]                    Launch resumed cloud GPU training loop
+Workflow 2: Retrain & Bring Your Own Model (BYOM)
+  vivacious login anirudha-s
+  vivacious prepare dataset <path>
+  vivacious prepare checkpoint <path>
+  vivacious permit anirudha-s ambition --model custom_model
+  vivacious permit anirudha-s ambition --model custom_model --method lora
+  vivacious permit anirudha-s ambition --model custom_model --method qlora
+  vivacious deploy anirudha-s
+  vivacious status <job-id>
+  vivacious download <job-id>
+
+Workflow 3: Resume Interrupted Workload
+  vivacious resume <job-id>
+  vivacious anirudha-s check
+  vivacious resume begin [--yes]
+
+Monitoring & Account Management:
+  vivacious balance
+  vivacious status <job-id>
+  vivacious logs <job-id>
+  vivacious download <job-id>
+  vivacious cancel <job-id> [--yes]
+  vivacious logout
 
 Options:
-  --model <model-id>                      Hugging Face model ID (e.g. meta-llama/Llama-3-8b)
-  --checkpoint <path>                     Local checkpoint tarball for retraining
+  --model <model-id>                      Target model identifier or custom_model
   --method <full|lora|qlora>              Fine-tuning method (default: full)
-  --yes, -y                               Auto-confirm prompts
+  --checkpoint <path>                     Local checkpoint tarball for retraining
+  --yes, -y                               Auto-confirm prompts without manual input
 `);
 }
 
@@ -1448,11 +1793,23 @@ async function main() {
   }
 
   switch (command) {
+    case 'anirudha-s': {
+      const sub = args[1];
+      if (sub === 'check') {
+        await handleResumeCheck();
+      } else {
+        console.error('[Error] Unrecognized founder command.');
+        console.error('Usage: vivacious anirudha-s check');
+        process.exit(1);
+      }
+      break;
+    }
+
     case 'login': {
       const target = args[1];
-      if (!target) {
-        console.error('Usage: vivacious login <workspace>');
-        console.error('Example: vivacious login anirudha-s');
+      if (target !== 'anirudha-s') {
+        console.error('[Error] Invalid login target.');
+        console.error('Usage: vivacious login anirudha-s');
         process.exit(1);
       }
       await handleLogin(target);
@@ -1484,21 +1841,13 @@ async function main() {
 
     case 'permit':
     case 'permits': {
-      const workspace = args[1];
-      const project = args[2];
-
-      if (!workspace || workspace.startsWith('--') || !project || project.startsWith('--')) {
-        console.error('Usage: vivacious permit <workspace> <project> --model <model-id> [--method <full|lora|qlora>]');
-        console.error('Example: vivacious permit anirudha-s ambition --model meta-llama/Llama-3-8b');
-        console.error('Example: vivacious permit anirudha-s ambition --model meta-llama/Llama-3-8b --method qlora');
-        process.exit(1);
-      }
-
       let permitModel = '';
       let permitMethod = 'full';
       let autoConfirm = false;
+      let hasFounder = false;
+      let hasAmbition = false;
 
-      for (let i = 3; i < args.length; i++) {
+      for (let i = 1; i < args.length; i++) {
         if (args[i] === '--model') {
           permitModel = args[i + 1] || '';
           i++;
@@ -1508,13 +1857,31 @@ async function main() {
           i++;
         } else if (args[i] === '--yes' || args[i] === '-y') {
           autoConfirm = true;
+        } else if (args[i] === 'anirudha-s') {
+          hasFounder = true;
+        } else if (args[i] === 'ambition') {
+          hasAmbition = true;
+        } else if (args[i].startsWith('--')) {
+          console.error(`[Error] Unrecognized option: ${args[i]}`);
+          process.exit(1);
+        } else {
+          console.error(`[Error] Unexpected positional argument: "${args[i]}".`);
+          console.error('Usage: vivacious permit anirudha-s ambition --model <model-id> [--method <full|lora|qlora>] [--yes]');
+          process.exit(1);
         }
+      }
+
+      if (!hasFounder || !hasAmbition) {
+        console.error('[Error] Missing required founder scope: "anirudha-s ambition"');
+        console.error('Usage: vivacious permit anirudha-s ambition --model <model-id> [--method <full|lora|qlora>] [--yes]');
+        process.exit(1);
       }
 
       if (!permitModel) {
         console.error('[Error] Missing required parameter: --model <model-id>');
-        console.error('Usage: vivacious permit <workspace> <project> --model <model-id> [--method <full|lora|qlora>]');
+        console.error('Usage: vivacious permit anirudha-s ambition --model <model-id> [--method <full|lora|qlora>] [--yes]');
         console.error('Example: vivacious permit anirudha-s ambition --model meta-llama/Llama-3-8b');
+        console.error('Example: vivacious permit anirudha-s ambition --model custom_model --method lora');
         process.exit(1);
       }
 
@@ -1523,19 +1890,13 @@ async function main() {
     }
 
     case 'deploy': {
-      const target = args[1];
-      if (!target || target.startsWith('--')) {
-        console.error('Usage: vivacious deploy <workspace>');
-        console.error('Example: vivacious deploy anirudha-s');
-        process.exit(1);
-      }
-
       let deployModel = '';
       let deployCheckpoint = '';
       let deployMethod = 'full';
       let autoConfirm = false;
+      let hasFounder = false;
 
-      for (let i = 2; i < args.length; i++) {
+      for (let i = 1; i < args.length; i++) {
         if (args[i] === '--model') {
           deployModel = args[i + 1] || '';
           i++;
@@ -1548,37 +1909,46 @@ async function main() {
           i++;
         } else if (args[i] === '--yes' || args[i] === '-y') {
           autoConfirm = true;
+        } else if (args[i] === 'anirudha-s') {
+          hasFounder = true;
+        } else if (args[i].startsWith('--')) {
+          console.error(`[Error] Unrecognized option: ${args[i]}`);
+          process.exit(1);
+        } else {
+          console.error(`[Error] Unexpected positional argument: "${args[i]}".`);
+          console.error('Usage: vivacious deploy anirudha-s [--model <model-id>] [--yes]');
+          process.exit(1);
         }
       }
 
-      await handleDeploy(target, deployModel || undefined, deployMethod, autoConfirm, deployCheckpoint || undefined);
+      if (!hasFounder) {
+        console.error('[Error] Missing required founder scope: "anirudha-s"');
+        console.error('Usage: vivacious deploy anirudha-s [--model <model-id>] [--yes]');
+        process.exit(1);
+      }
+
+      await handleDeploy('anirudha-s', deployModel || undefined, deployMethod, autoConfirm, deployCheckpoint || undefined);
       break;
     }
 
     case 'resume': {
       const sub = args[1];
-      if (!sub) {
-        console.error('Usage: vivacious resume <job-id> | vivacious resume begin [--yes]');
-        console.error('Example: vivacious resume job_8f29ab01');
-        console.error('Example: vivacious resume begin');
-        process.exit(1);
+      if (!sub || sub === '--help' || sub === '-h' || sub === 'help') {
+        console.log('Usage: vivacious resume <job-id> | vivacious resume check | vivacious resume begin [--yes]');
+        console.log('Example: vivacious resume job_8f29ab01');
+        console.log('Example: vivacious resume check');
+        console.log('Example: vivacious resume begin --yes');
+        process.exit(0);
       }
 
       if (sub === 'begin') {
         const autoConfirm = args.includes('--yes') || args.includes('-y');
         await handleResumeBegin(autoConfirm);
+      } else if (sub === 'check') {
+        await handleResumeCheck();
       } else {
         await handleResumeInspect(sub);
       }
-      break;
-    }
-
-    case 'anirudha-s': {
-      if (args[1] !== 'check') {
-        console.error('Unknown subcommand. Did you mean: vivacious anirudha-s check?');
-        process.exit(1);
-      }
-      await handleResumeCheck();
       break;
     }
 
