@@ -1434,7 +1434,8 @@ async function handleDownload(jobId: string, directDownload: boolean = true) {
     const data: any = await res.json();
     if (!res.ok || !data.downloadUrl) {
       console.error(`\n[Error] Download link generation failed: ${data.error || 'Unknown error'}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log('\n=============================================');
@@ -1485,7 +1486,8 @@ async function handleDownload(jobId: string, directDownload: boolean = true) {
     }
   } catch (err: any) {
     console.error(`[Error] Failed to get download link: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 }
 
@@ -1516,13 +1518,15 @@ async function handleCancel(jobId: string, autoConfirm: boolean = false) {
     const data: any = await res.json();
     if (!res.ok) {
       console.error(`[Error] Cancellation failed: ${data.error || 'Unknown error'}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log(`\n✅ Job ${jobId} successfully marked for termination. Final compute settled.`);
   } catch (err: any) {
     console.error(`[Error] Failed to cancel job: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 }
 
@@ -1552,7 +1556,8 @@ async function handleResumeInspect(jobId: string) {
     const data: any = await res.json();
     if (!res.ok || !data.success || !data.resumeAvailable) {
       console.error(`\n[Inspection Error] ${data.error || 'Workload is not eligible for resumption.'}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     const job = data.job;
@@ -1584,7 +1589,8 @@ async function handleResumeInspect(jobId: string) {
     saveConfig(config);
   } catch (err: any) {
     console.error(`\n[Error] Failed to inspect checkpoint: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 }
 
@@ -1595,7 +1601,8 @@ async function handleResumeCheck() {
   const resume = config.resumeContext;
   if (!resume || !resume.jobId || !resume.resumeAttemptId) {
     console.error('[Error] No resume workload staged. Please run "vivacious resume <job-id>" first.');
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   console.log(`\n=============================================`);
@@ -1622,7 +1629,8 @@ async function handleResumeCheck() {
     const data: any = await res.json();
     if (!res.ok) {
       console.error(`\n[Permit Error] ${data.error || 'Server failed to calculate resume permit.'}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log(`Available Balance:    ₹${Number(data.currentBalance || 0).toFixed(2)}`);
@@ -1638,7 +1646,8 @@ async function handleResumeCheck() {
       console.error(`Current balance: ₹${Number(data.currentBalance || 0).toFixed(2)}.`);
       console.error(`Please recharge your account via the Dashboard (Billing) and re-run:`);
       console.error(`  vivacious anirudha-s check`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log(`✅ [FINANCIAL PERMIT GRANTED] (Valid for 15 minutes, Single-Use)`);
@@ -1651,7 +1660,8 @@ async function handleResumeCheck() {
     saveConfig(config);
   } catch (err: any) {
     console.error(`\n[Error] Failed to authorize resume permit: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 }
 
@@ -1665,7 +1675,8 @@ async function handleResumeBegin(autoConfirm: boolean = false) {
     console.error('Please complete the pre-flight check first:');
     console.error('  1. vivacious resume <job-id>');
     console.error('  2. vivacious anirudha-s check');
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   console.log(`\n=============================================`);
@@ -1703,7 +1714,8 @@ async function handleResumeBegin(autoConfirm: boolean = false) {
     const data: any = await res.json();
     if (!res.ok || !data.success) {
       console.error(`\n[Deployment Error] ${data.error || 'Server failed to resume workload.'}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
 
     console.log('\n=============================================');
@@ -1723,7 +1735,8 @@ async function handleResumeBegin(autoConfirm: boolean = false) {
     saveConfig(config);
   } catch (err: any) {
     console.error(`\n[Error] Resumed deployment connection failed: ${err.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 }
 
