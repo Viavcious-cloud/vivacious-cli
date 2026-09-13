@@ -600,6 +600,162 @@ function checkJsonNestingDepth(jsonString: string, maxDepth: number = 30): boole
   return { isValid: true, modelConfig };
 }
 
+export interface DatasetValidationResult {
+  isValid: boolean;
+  format?: 'alpaca' | 'sharegpt_messages' | 'text' | 'raw_jsonl' | undefined;
+  sampleCount: number;
+  error?: string | undefined;
+  warning?: string | undefined;
+}
+
+/**
+ * Pre-flight local validation of training datasets before any cloud storage upload or GPU spend.
+ * Validates JSON/JSONL syntactic validity and checks for standard training schemas (instruction/output,
+ * prompt/completion, messages, or text) to prevent mid-run Python SFTTrainer crashes.
+ */
+export async function validateDatasetFile(filePath: string): Promise<DatasetValidationResult> {
+  const ext = path.extname(filePath).toLowerCase();
+  
+  if (!['.jsonl', '.json', '.csv', '.parquet', '.txt'].includes(ext)) {
+    return {
+      isValid: false,
+      sampleCount: 0,
+      error: `Unsupported dataset format: '${ext}'. Supported extensions are: .jsonl, .json, .csv, .parquet, .txt`
+    };
+  }
+
+  // If CSV or Parquet, perform basic size check (detailed parsing in Python)
+  if (ext === '.csv' || ext === '.parquet' || ext === '.txt') {
+    return {
+      isValid: true,
+      format: 'raw_jsonl',
+      sampleCount: 1
+    };
+  }
+
+  const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+  const rl = readline.createInterface({
+    input: fileStream,
+    crlfDelay: Infinity
+  });
+
+  let lineCount = 0;
+  let detectedFormat: 'alpaca' | 'sharegpt_messages' | 'text' | 'raw_jsonl' | undefined;
+  let parsedJsonArray: any[] | null = null;
+
+  try {
+    if (ext === '.json') {
+      // For JSON files, parse either an array of objects or an object
+      const fullContent = await fs.promises.readFile(filePath, 'utf-8');
+      if (!fullContent.trim()) {
+        return { isValid: false, sampleCount: 0, error: 'Dataset JSON file is empty (0 records).' };
+      }
+      const data = JSON.parse(fullContent);
+      if (Array.isArray(data)) {
+        parsedJsonArray = data;
+        if (data.length === 0) {
+          return { isValid: false, sampleCount: 0, error: 'Dataset JSON array contains 0 records.' };
+        }
+      } else if (typeof data === 'object' && data !== null) {
+        parsedJsonArray = [data];
+      } else {
+        return { isValid: false, sampleCount: 0, error: 'Dataset JSON must contain an array of objects or a single JSON object.' };
+      }
+    }
+
+    if (parsedJsonArray) {
+      // Validate array samples (up to first 100)
+      const samplesToCheck = parsedJsonArray.slice(0, 100);
+      for (let idx = 0; idx < samplesToCheck.length; idx++) {
+        const item = samplesToCheck[idx];
+        if (!item || typeof item !== 'object') {
+          return { isValid: false, sampleCount: 0, error: `Record ${idx + 1} is not a valid JSON object.` };
+        }
+        if (!detectedFormat) {
+          if ('instruction' in item && 'output' in item) detectedFormat = 'alpaca';
+          else if ('prompt' in item && 'completion' in item) detectedFormat = 'alpaca';
+          else if ('messages' in item && Array.isArray(item.messages)) detectedFormat = 'sharegpt_messages';
+          else if ('text' in item && typeof item.text === 'string') detectedFormat = 'text';
+          else detectedFormat = 'raw_jsonl';
+        }
+      }
+      return {
+        isValid: true,
+        format: detectedFormat || 'raw_jsonl',
+        sampleCount: parsedJsonArray.length
+      };
+    }
+
+    // Stream inspect line-by-line for .jsonl
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue; // skip blank lines
+      lineCount++;
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (parseErr: any) {
+        return {
+          isValid: false,
+          sampleCount: lineCount,
+          error: `Malformed JSON on line ${lineCount}: ${parseErr.message}\nProblematic line preview: ${trimmed.slice(0, 120)}`
+        };
+      }
+
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        return {
+          isValid: false,
+          sampleCount: lineCount,
+          error: `Invalid record on line ${lineCount}: Each JSONL line must be a JSON object, received ${Array.isArray(parsed) ? 'array' : typeof parsed}.`
+        };
+      }
+
+      // Check first 50 lines for recognized schema
+      if (lineCount <= 50 && !detectedFormat) {
+        if (('instruction' in parsed && 'output' in parsed) || ('prompt' in parsed && 'completion' in parsed)) {
+          detectedFormat = 'alpaca';
+        } else if ('messages' in parsed && Array.isArray(parsed.messages)) {
+          detectedFormat = 'sharegpt_messages';
+        } else if ('text' in parsed && typeof parsed.text === 'string') {
+          detectedFormat = 'text';
+        }
+      }
+    }
+
+    if (lineCount === 0) {
+      return {
+        isValid: false,
+        sampleCount: 0,
+        error: 'Dataset file contains 0 valid training lines.'
+      };
+    }
+
+    // If no standard schema was detected in first 50 lines, provide informative warning
+    let warning: string | undefined;
+    if (!detectedFormat) {
+      detectedFormat = 'raw_jsonl';
+      warning = 'No standard columns (instruction/output, prompt/completion, messages, or text) detected. Runner will attempt generic stringification.';
+    }
+
+    return {
+      isValid: true,
+      format: detectedFormat,
+      sampleCount: lineCount,
+      warning
+    };
+  } catch (readErr: any) {
+    return {
+      isValid: false,
+      sampleCount: lineCount,
+      error: `Failed to inspect dataset file: ${readErr.message}`
+    };
+  } finally {
+    rl.close();
+    fileStream.destroy();
+  }
+}
+
 
 // 1. Device Authorization Login
 async function handleLogin(target: string = 'anirudha-s') {
@@ -752,6 +908,29 @@ async function handlePrepare(inputPath: string, type: 'dataset' | 'checkpoint' =
     return;
   }
 
+  // Pre-flight Dataset Syntactic & Schema Validation
+  if (!stat.isDirectory()) {
+    console.log(`Validating dataset structure and training schema...`);
+    const valResult = await validateDatasetFile(absolutePath);
+    if (!valResult.isValid) {
+      console.error(`\n=============================================`);
+      console.error(`❌ [DATASET VALIDATION FAILED]`);
+      console.error(`=============================================`);
+      console.error(valResult.error);
+      console.error(`\nUpload blocked before incurring any GPU compute or storage costs.`);
+      console.error(`Please fix the format of ${filename} and re-run:`);
+      console.error(`  vivacious prepare ${inputPath}`);
+      console.error(`=============================================`);
+      process.exit(1);
+    }
+
+    console.log(`Schema Format:         ${valResult.format ? valResult.format.toUpperCase() : 'UNKNOWN'}`);
+    console.log(`Valid Training Items:  ${valResult.sampleCount.toLocaleString()}`);
+    if (valResult.warning) {
+      console.warn(`⚠️  Notice: ${valResult.warning}`);
+    }
+  }
+
   const prepared: PreparedDataset = {
     path: absolutePath,
     filename,
@@ -768,7 +947,7 @@ async function handlePrepare(inputPath: string, type: 'dataset' | 'checkpoint' =
   console.log(`Total Dataset Size:    ${(totalSize / (1024 * 1024)).toFixed(2)} MB (${totalSize.toLocaleString()} bytes)`);
   console.log(`SHA-256 Fingerprint:   ${sha256Fingerprint}`);
   console.log(`=============================================`);
-  console.log(`\n✅ [Dataset Prepared Locally] Streaming SHA-256 manifest computed.`);
+  console.log(`\n✅ [Dataset Validated & Prepared Locally] Streaming SHA-256 manifest computed.`);
   console.log(`Zero cloud transfer or GPU compute incurred.`);
   console.log(`Next step: Run 'vivacious permit anirudha-s ambition --model <model-id>' or 'vivacious deploy anirudha-s'.`);
 }
