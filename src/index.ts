@@ -1005,11 +1005,20 @@ async function handlePermit(modelId?: string, method: string = 'full', autoConfi
     if (data.estimate) {
       const est = data.estimate;
 
+      const hoursNum = Number(est.estimatedHours || 0.15);
+      const totalMinutes = Math.round(hoursNum * 60);
+      let durationStr = totalMinutes < 60 
+        ? `~${totalMinutes} mins (${hoursNum.toFixed(2)} hrs)` 
+        : `${Math.floor(totalMinutes / 60)}h ${totalMinutes % 60}m (${hoursNum.toFixed(2)} hrs)`;
+      if (est.bootMinutes && est.trainMinutes && est.finalizeMinutes) {
+        durationStr += ` [Boot ~${Math.round(est.bootMinutes)}m | Train ~${Math.round(est.trainMinutes)}m | Upload ~${Math.round(est.finalizeMinutes)}m]`;
+      }
+
       console.log('---------------------------------------------');
       console.log(`Target Model:           ${est.modelId}`);
       console.log(`Training Method:        ${method.toUpperCase()}`);
       console.log(`Allocated GPU Tier:     ${est.gpuTier}`);
-      console.log(`Estimated Duration:     ${est.estimatedHours} hours`);
+      console.log(`Estimated Duration:     ${durationStr}`);
       console.log(`Effective Hourly Rate:  ₹${est.hourlyRate.toFixed(2)}/hour`);
       console.log(`Estimated Total Cost:   ₹${Number(est.estimatedTotal || data.estimatedTotal || 0).toFixed(2)}`);
       console.log(`Permit Reference:       ${data.permitRef}`);
@@ -1445,10 +1454,16 @@ async function handleDeploy(target: string = 'anirudha-s', modelId?: string, met
     console.log('\n=============================================');
     console.log('✅ DEPLOYMENT LAUNCHED SUCCESSFULLY');
     console.log('=============================================');
+    const deployHours = Number(deployData.estimatedHours || 0.15);
+    const deployMinutes = Math.round(deployHours * 60);
+    const deployDurationStr = deployMinutes < 60 
+      ? `~${deployMinutes} mins (${deployHours.toFixed(2)} hours)` 
+      : `${Math.floor(deployMinutes / 60)}h ${deployMinutes % 60}m (${deployHours.toFixed(2)} hours)`;
+
     console.log(`Job ID:               ${deployData.jobId}`);
     console.log(`Initial Job Status:   ${(deployData.status || 'QUEUED').toUpperCase()}`);
     console.log(`Allocated GPU Tier:   ${deployData.gpuTier || 'Standard'}`);
-    console.log(`Estimated Duration:   ${Number(deployData.estimatedHours || 1).toFixed(2)} hours`);
+    console.log(`Estimated Duration:   ${deployDurationStr}`);
     console.log(`Estimated Total Cost: ₹${Number(deployData.estimatedTotal || 0).toFixed(2)} (Billing: ${(deployData.billingMode || 'PREPAID').toUpperCase()})`);
     console.log('\nNext Steps:');
     console.log(`  To monitor real-time progress, run: vivacious status ${deployData.jobId}`);
@@ -1752,7 +1767,7 @@ async function handleResumeInspect(jobId: string) {
     console.log(`7-Day Expiration:     ${expiresDate}`);
     console.log(`---------------------------------------------`);
     console.log(`✅ [Checkpoint Verified & Staged for Resumption]`);
-    console.log(`Next Step: Run 'vivacious anirudha-s check' to calculate remaining compute and authorize resumption.`);
+    console.log(`Next Step: Run 'vivacious resume check' to calculate remaining compute and authorize resumption.`);
     console.log(`=============================================`);
 
     config.resumeContext = {
@@ -1824,7 +1839,7 @@ async function handleResumeCheck() {
       console.error(`Your account requires ₹${Number(data.remainingEstimatedTotal || 0).toFixed(2)} to complete this training run.`);
       console.error(`Current balance: ₹${Number(data.currentBalance || 0).toFixed(2)}.`);
       console.error(`Please recharge your account via the Dashboard (Billing) and re-run:`);
-      console.error(`  vivacious anirudha-s check`);
+      console.error(`  vivacious resume check`);
       process.exitCode = 1;
       return;
     }
