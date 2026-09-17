@@ -593,7 +593,7 @@ export async function scanAndValidateCheckpointArchive(
 			bytesRead: number;
 			isPax: boolean;
 		} | null = null;
-		const targetConfigChunks: Buffer[] = [];
+		let targetConfigChunks: Buffer[] = [];
 		let targetPaxChunks: Buffer[] = [];
 		let localPaxOverrides: Record<string, string> = {};
 		let globalPaxOverrides: Record<string, string> = {};
@@ -863,13 +863,15 @@ export async function scanAndValidateCheckpointArchive(
 							const needed = currentEntry.size - currentEntry.bytesRead;
 							const available = Math.min(needed, buffer.length);
 							const chunkData = buffer.subarray(0, available);
+							const basename = path.posix.basename(currentEntry.name);
+							const isExactConfig =
+								!currentEntry.isPax &&
+								basename === "config.json" &&
+								extractedConfigBuffer === null;
 
 							if (currentEntry.isPax) {
 								targetPaxChunks.push(Buffer.from(chunkData));
-							} else if (
-								currentEntry.name.endsWith("config.json") ||
-								currentEntry.name === "config.json"
-							) {
+							} else if (isExactConfig) {
 								if (
 									currentEntry.bytesRead + chunkData.length <=
 									MAX_CONFIG_JSON_BYTES
@@ -891,11 +893,9 @@ export async function scanAndValidateCheckpointArchive(
 										localPaxOverrides = { ...localPaxOverrides, ...parsed };
 									}
 									targetPaxChunks = [];
-								} else if (
-									currentEntry.name.endsWith("config.json") ||
-									currentEntry.name === "config.json"
-								) {
+								} else if (isExactConfig) {
 									extractedConfigBuffer = Buffer.concat(targetConfigChunks);
+									targetConfigChunks = [];
 								}
 
 								// Tar blocks are padded to 512-byte boundaries
@@ -960,16 +960,19 @@ export async function scanAndValidateCheckpointArchive(
 			const parsed = JSON.parse(rawText);
 			const estimatedParams = estimateParametersFromConfig(parsed);
 
+			const hidden = Number(parsed.hidden_size || parsed.d_model || parsed.n_embd) || 4096;
+			const layers = Number(parsed.num_hidden_layers || parsed.n_layer || parsed.n_layers) || 32;
+			const heads = Number(parsed.num_attention_heads || parsed.n_head) || 32;
+			const intermediate = Number(parsed.intermediate_size || parsed.n_inner) || (hidden * 4);
+
 			modelConfig = {
 				modelType: parsed.model_type || "custom_causal_lm",
-				hiddenSize: parsed.hidden_size || parsed.d_model || 4096,
-				numHiddenLayers: parsed.num_hidden_layers || parsed.n_layer || 32,
-				numAttentionHeads: parsed.num_attention_heads || parsed.n_head || 32,
-				intermediateSize:
-					parsed.intermediate_size ||
-					(parsed.hidden_size ? parsed.hidden_size * 4 : 11008),
+				hiddenSize: hidden,
+				numHiddenLayers: layers,
+				numAttentionHeads: heads,
+				intermediateSize: intermediate,
 				vocabSize: parsed.vocab_size || 32000,
-				architectures: parsed.architectures || ["LlamaForCausalLM"],
+				architectures: parsed.architectures || [parsed.model_type ? `${parsed.model_type}LMHeadModel` : "LlamaForCausalLM"],
 				parameterCount: estimatedParams || undefined,
 			};
 		} catch {
@@ -988,14 +991,19 @@ export async function scanAndValidateCheckpointArchive(
 				const raw = fs.readFileSync(adjacentConfigPath, "utf-8");
 				const parsed = JSON.parse(raw);
 				const estimatedParams = estimateParametersFromConfig(parsed);
+				const hidden = Number(parsed.hidden_size || parsed.d_model || parsed.n_embd) || 4096;
+				const layers = Number(parsed.num_hidden_layers || parsed.n_layer || parsed.n_layers) || 32;
+				const heads = Number(parsed.num_attention_heads || parsed.n_head) || 32;
+				const intermediate = Number(parsed.intermediate_size || parsed.n_inner) || (hidden * 4);
+
 				modelConfig = {
 					modelType: parsed.model_type || "custom_causal_lm",
-					hiddenSize: parsed.hidden_size || 4096,
-					numHiddenLayers: parsed.num_hidden_layers || 32,
-					numAttentionHeads: parsed.num_attention_heads || 32,
-					intermediateSize: parsed.intermediate_size || 11008,
+					hiddenSize: hidden,
+					numHiddenLayers: layers,
+					numAttentionHeads: heads,
+					intermediateSize: intermediate,
 					vocabSize: parsed.vocab_size || 32000,
-					architectures: parsed.architectures || ["LlamaForCausalLM"],
+					architectures: parsed.architectures || [parsed.model_type ? `${parsed.model_type}LMHeadModel` : "LlamaForCausalLM"],
 					parameterCount: estimatedParams || undefined,
 				};
 			} catch {
