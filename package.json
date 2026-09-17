@@ -7,6 +7,7 @@
     "vivacious": "./dist/index.js"
   },
   "scripts": {
+    "lint": "eslint --config ../eslint.config.js src --max-warnings 0",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "ts-node src/index.ts"
