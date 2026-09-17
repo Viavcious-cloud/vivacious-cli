@@ -122,6 +122,31 @@ export function parseJwtExpiryMs(token: string): number | null {
 	}
 }
 
+/**
+ * Universal safe API error formatter — guarantees zero [object Object] output
+ */
+export function formatApiError(err: any): string {
+	if (!err) return "Unknown error";
+	if (typeof err === "string") return err;
+	if (err.message && typeof err.message === "string") return err.message;
+	if (err.error) {
+		if (typeof err.error === "string") return err.error;
+		if (err.error.message && typeof err.error.message === "string")
+			return err.error.message;
+		if (Array.isArray(err.error))
+			return err.error
+				.map((e: any) => (typeof e === "string" ? e : e.message || JSON.stringify(e)))
+				.join(", ");
+		return JSON.stringify(err.error);
+	}
+	if (Array.isArray(err.errors)) {
+		return err.errors
+			.map((e: any) => (typeof e === "string" ? e : e.message || JSON.stringify(e)))
+			.join(", ");
+	}
+	return JSON.stringify(err);
+}
+
 export async function getValidAccessToken(
 	forceRefresh: boolean = false
 ): Promise<string> {
@@ -130,7 +155,8 @@ export async function getValidAccessToken(
 		console.error(
 			'[Error] You are not logged in. Please run "vivacious login anirudha-s" first.'
 		);
-		process.exit(1);
+		process.exitCode = 1;
+		return "";
 	}
 
 	const now = Date.now();
@@ -178,10 +204,11 @@ export async function getValidAccessToken(
 	if (tokenExp > 0 && tokenExp <= now) {
 		console.error("\n[Notice] Your authentication session has expired.");
 		console.error('Please run "vivacious login anirudha-s" to authenticate.\n');
-		process.exit(1);
+		process.exitCode = 1;
+		return "";
 	}
 
-	return config.accessToken!;
+	return config.accessToken || "";
 }
 
 function loadConfig(): Config {
@@ -347,10 +374,20 @@ export function estimateParametersFromConfig(config: any): number | null {
 	}
 
 	const hiddenSize = Number(
-		config.hidden_size || config.d_model || config.n_embd
+		config.hidden_size ||
+			config.d_model ||
+			config.n_embd ||
+			config.n_emb ||
+			config.embedding_size ||
+			config.hidden_dim
 	);
 	const numLayers = Number(
-		config.num_hidden_layers || config.n_layer || config.n_layers
+		config.num_hidden_layers ||
+			config.n_layer ||
+			config.n_layers ||
+			config.num_layers ||
+			config.encoder_layers ||
+			config.decoder_layers
 	);
 
 	if (!hiddenSize || !numLayers || hiddenSize <= 0 || numLayers <= 0) {
@@ -361,18 +398,37 @@ export function estimateParametersFromConfig(config: any): number | null {
 	const boundedNumLayers = Math.max(1, Math.min(256, numLayers));
 	const vocabSize = Math.max(
 		1,
-		Math.min(1000000, Number(config.vocab_size || 32000) || 32000)
+		Math.min(
+			1000000,
+			Number(config.vocab_size || config.padded_vocab_size || 32000) || 32000
+		)
 	);
 	const numHeads = Math.max(
 		1,
 		Math.min(
 			256,
-			Number(config.num_attention_heads || config.n_head || 32) || 32
+			Number(
+				config.num_attention_heads ||
+					config.n_head ||
+					config.num_heads ||
+					config.n_heads ||
+					config.num_attention_heads_per_partition ||
+					32
+			) || 32
 		)
 	);
 	const numKvHeads = Math.max(
 		1,
-		Math.min(256, Number(config.num_key_value_heads || numHeads) || numHeads)
+		Math.min(
+			256,
+			Number(
+				config.num_key_value_heads ||
+					config.num_kv_heads ||
+					config.n_head_kv ||
+					config.multi_query_group_num ||
+					numHeads
+			) || numHeads
+		)
 	);
 	const headDim = Number(config.head_dim || boundedHiddenSize / numHeads);
 	const intermediateSize = Math.max(
@@ -380,18 +436,35 @@ export function estimateParametersFromConfig(config: any): number | null {
 		Math.min(
 			262144,
 			Number(
-				config.intermediate_size || config.n_inner || boundedHiddenSize * 4
+				config.intermediate_size ||
+					config.n_inner ||
+					config.d_ff ||
+					config.ffn_dim ||
+					boundedHiddenSize * 4
 			) || boundedHiddenSize * 4
 		)
 	);
+	const modelType = (config.model_type || "").toLowerCase();
+	const archName = (config.architectures?.[0] || "").toLowerCase();
 	const isGatedMlp = Boolean(
 		config.hidden_act === "silu" ||
-			config.architectures?.[0]?.includes("Llama") ||
-			config.architectures?.[0]?.includes("Mistral") ||
-			config.architectures?.[0]?.includes("Qwen") ||
-			config.architectures?.[0]?.includes("Mixtral")
+			config.hidden_activation === "silu" ||
+			config.hidden_act === "swish" ||
+			modelType.includes("llama") ||
+			modelType.includes("mistral") ||
+			modelType.includes("qwen") ||
+			modelType.includes("gemma") ||
+			modelType.includes("mixtral") ||
+			archName.includes("llama") ||
+			archName.includes("mistral") ||
+			archName.includes("qwen") ||
+			archName.includes("gemma") ||
+			archName.includes("mixtral")
 	);
-	const tieWordEmbeddings = Boolean(config.tie_word_embeddings ?? false);
+	const tieWordEmbeddings = Boolean(
+		config.tie_word_embeddings ??
+			(modelType === "gpt2" || archName.includes("gpt2"))
+	);
 
 	// 1. Embeddings
 	let embeddingParams = vocabSize * boundedHiddenSize;
@@ -420,7 +493,6 @@ export function estimateParametersFromConfig(config: any): number | null {
 			config.n_inner ||
 			boundedHiddenSize * 4
 	);
-	const archName = (config.architectures?.[0] || "").toLowerCase();
 
 	let mlpParamsPerLayer: number;
 	if (numLocalExperts > 1) {
@@ -960,23 +1032,56 @@ export async function scanAndValidateCheckpointArchive(
 			const parsed = JSON.parse(rawText);
 			const estimatedParams = estimateParametersFromConfig(parsed);
 
-			const hidden = Number(parsed.hidden_size || parsed.d_model || parsed.n_embd) || 4096;
-			const layers = Number(parsed.num_hidden_layers || parsed.n_layer || parsed.n_layers) || 32;
-			const heads = Number(parsed.num_attention_heads || parsed.n_head) || 32;
-			const intermediate = Number(parsed.intermediate_size || parsed.n_inner) || (hidden * 4);
+			if (!estimatedParams) {
+				const foundKeys = Object.keys(parsed).slice(0, 10).join(", ");
+				return {
+					isValid: false,
+					error: `Checkpoint config.json is missing required model architecture parameters. Expected 'hidden_size'/'num_hidden_layers'/'num_attention_heads' (Llama/Mistral/Qwen/BERT) or 'n_embd'/'n_layer'/'n_head' (GPT-2). Found keys: [${foundKeys}]`,
+				};
+			}
+
+			const hidden =
+				Number(
+					parsed.hidden_size ||
+						parsed.d_model ||
+						parsed.n_embd ||
+						parsed.n_emb ||
+						parsed.embedding_size
+				) || 4096;
+			const layers =
+				Number(
+					parsed.num_hidden_layers ||
+						parsed.n_layer ||
+						parsed.n_layers ||
+						parsed.num_layers
+				) || 32;
+			const heads =
+				Number(parsed.num_attention_heads || parsed.n_head || parsed.num_heads) ||
+				32;
+			const intermediate =
+				Number(parsed.intermediate_size || parsed.n_inner || parsed.d_ff) ||
+				hidden * 4;
 
 			modelConfig = {
+				...parsed,
 				modelType: parsed.model_type || "custom_causal_lm",
 				hiddenSize: hidden,
 				numHiddenLayers: layers,
 				numAttentionHeads: heads,
 				intermediateSize: intermediate,
 				vocabSize: parsed.vocab_size || 32000,
-				architectures: parsed.architectures || [parsed.model_type ? `${parsed.model_type}LMHeadModel` : "LlamaForCausalLM"],
-				parameterCount: estimatedParams || undefined,
+				architectures: parsed.architectures || [
+					parsed.model_type
+						? `${parsed.model_type}LMHeadModel`
+						: "LlamaForCausalLM",
+				],
+				parameterCount: estimatedParams,
 			};
-		} catch {
-			/* config.json parse failure — modelConfig stays null; handled by the fallback below */
+		} catch (parseErr: any) {
+			return {
+				isValid: false,
+				error: `Defensive archive scan rejected: config.json JSON parse error (${parseErr.message})`,
+			};
 		}
 	}
 
@@ -991,23 +1096,58 @@ export async function scanAndValidateCheckpointArchive(
 				const raw = fs.readFileSync(adjacentConfigPath, "utf-8");
 				const parsed = JSON.parse(raw);
 				const estimatedParams = estimateParametersFromConfig(parsed);
-				const hidden = Number(parsed.hidden_size || parsed.d_model || parsed.n_embd) || 4096;
-				const layers = Number(parsed.num_hidden_layers || parsed.n_layer || parsed.n_layers) || 32;
-				const heads = Number(parsed.num_attention_heads || parsed.n_head) || 32;
-				const intermediate = Number(parsed.intermediate_size || parsed.n_inner) || (hidden * 4);
+
+				if (!estimatedParams) {
+					const foundKeys = Object.keys(parsed).slice(0, 10).join(", ");
+					return {
+						isValid: false,
+						error: `Checkpoint config.json is missing required model architecture parameters. Expected 'hidden_size'/'num_hidden_layers'/'num_attention_heads' (Llama/Mistral/Qwen/BERT) or 'n_embd'/'n_layer'/'n_head' (GPT-2). Found keys: [${foundKeys}]`,
+					};
+				}
+
+				const hidden =
+					Number(
+						parsed.hidden_size ||
+							parsed.d_model ||
+							parsed.n_embd ||
+							parsed.n_emb ||
+							parsed.embedding_size
+					) || 4096;
+				const layers =
+					Number(
+						parsed.num_hidden_layers ||
+							parsed.n_layer ||
+							parsed.n_layers ||
+							parsed.num_layers
+					) || 32;
+				const heads =
+					Number(
+						parsed.num_attention_heads || parsed.n_head || parsed.num_heads
+					) || 32;
+				const intermediate =
+					Number(parsed.intermediate_size || parsed.n_inner || parsed.d_ff) ||
+					hidden * 4;
 
 				modelConfig = {
+					...parsed,
 					modelType: parsed.model_type || "custom_causal_lm",
 					hiddenSize: hidden,
 					numHiddenLayers: layers,
 					numAttentionHeads: heads,
 					intermediateSize: intermediate,
 					vocabSize: parsed.vocab_size || 32000,
-					architectures: parsed.architectures || [parsed.model_type ? `${parsed.model_type}LMHeadModel` : "LlamaForCausalLM"],
-					parameterCount: estimatedParams || undefined,
+					architectures: parsed.architectures || [
+						parsed.model_type
+							? `${parsed.model_type}LMHeadModel`
+							: "LlamaForCausalLM",
+					],
+					parameterCount: estimatedParams,
 				};
-			} catch {
-				/* adjacent config.json parse failure — modelConfig stays null; handled by the if check below */
+			} catch (adjErr: any) {
+				return {
+					isValid: false,
+					error: `Adjacent config.json parse error: ${adjErr.message}`,
+				};
 			}
 		}
 	}
@@ -1300,16 +1440,18 @@ async function handleLogin(target: string = "anirudha-s") {
 					return;
 				}
 
-				const errData: any = await tokenRes.json();
+				const errData: any = await tokenRes.json().catch(() => ({}));
 				if (errData.error === "authorization_pending") {
 				} else if (errData.error === "expired_token") {
 					console.error(
-						'\n[Error] Login attempt expired. Please run "vivacious login" again.'
+						'\n[Error] Login attempt expired. Please run "vivacious login anirudha-s" again.'
 					);
-					process.exit(1);
+					process.exitCode = 1;
+					return;
 				} else {
-					console.error(`\n[Error] Login failed: ${errData.error}`);
-					process.exit(1);
+					console.error(`\n[Error] Login failed: ${formatApiError(errData)}`);
+					process.exitCode = 1;
+					return;
 				}
 			} catch (err: any) {
 				console.warn(
@@ -1319,12 +1461,14 @@ async function handleLogin(target: string = "anirudha-s") {
 		}
 
 		console.error("\n[Error] Login timed out. Please try again.");
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	} catch (err: any) {
 		console.error(
 			`\n[Error] Failed to connect to orchestrator: ${err.message}`
 		);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 }
 
@@ -1336,7 +1480,8 @@ async function handlePrepare(
 	const absolutePath = path.resolve(inputPath);
 	if (!fs.existsSync(absolutePath)) {
 		console.error(`[Error] Target path not found: ${inputPath}`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 
 	const stat = fs.statSync(absolutePath);
@@ -1371,7 +1516,8 @@ async function handlePrepare(
 
 	if (totalSize === 0) {
 		console.error(`[Error] Staging target is empty (0 bytes).`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 
 	const config = loadConfig();
@@ -1385,7 +1531,8 @@ async function handlePrepare(
 			console.error(
 				`[Error] Checkpoint archive validation failed: ${scanResult.error}`
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 
 		const preparedCheckpoint: PreparedCheckpoint = {
@@ -1414,7 +1561,7 @@ async function handlePrepare(
 		console.log(`=============================================`);
 		console.log(`✅ [Custom Checkpoint Staged Locally]`);
 		console.log(
-			`Next step: Run 'vivacious deploy anirudha-s --checkpoint' to train from this base.`
+			`Next step: Run 'vivacious permit anirudha-s ambition --model custom_model' or 'vivacious deploy anirudha-s'.`
 		);
 		return;
 	}
@@ -1434,7 +1581,8 @@ async function handlePrepare(
 			console.error(`Please fix the format of ${filename} and re-run:`);
 			console.error(`  vivacious prepare ${inputPath}`);
 			console.error(`=============================================`);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 
 		console.log(
@@ -1482,9 +1630,15 @@ async function handlePermit(
 	autoConfirm: boolean = false
 ): Promise<boolean> {
 	const accessToken = await getValidAccessToken();
+	if (!accessToken) {
+		process.exitCode = 1;
+		return false;
+	}
 	const config = loadConfig();
 
 	const prepared = config.preparedDataset;
+	const preparedCheckpoint = config.preparedCheckpoint;
+
 	if (!prepared && modelId) {
 		console.warn(
 			"[Notice] No local dataset prepared yet. Using default reference sizing (100 MB)."
@@ -1492,14 +1646,37 @@ async function handlePermit(
 	}
 
 	const payload: Record<string, any> = {};
-	if (modelId) {
-		payload.modelId = modelId;
-		payload.method = method || "full";
-		if (prepared) {
-			payload.datasetSizeBytes = prepared.sizeBytes;
-			payload.datasetFingerprint = prepared.sha256;
-			payload.fileCount = prepared.fileCount;
+	const effectiveModelId = modelId || "";
+
+	// Check if target is a custom checkpoint archive or custom model
+	const isCustom =
+		effectiveModelId === "custom_model" ||
+		(effectiveModelId.length > 0 &&
+			(fs.existsSync(effectiveModelId) ||
+				effectiveModelId.endsWith(".tar.gz") ||
+				effectiveModelId.includes("\\") ||
+				effectiveModelId.includes("/"))) ||
+		(Boolean(preparedCheckpoint) &&
+			(!effectiveModelId ||
+				effectiveModelId === preparedCheckpoint?.filename ||
+				effectiveModelId === preparedCheckpoint?.path));
+
+	if (isCustom) {
+		payload.modelId = "custom_model";
+		payload.modelSource = "custom_checkpoint";
+		if (preparedCheckpoint?.modelConfig) {
+			payload.checkpointConfig = preparedCheckpoint.modelConfig;
+			payload.checkpointFingerprint = preparedCheckpoint.sha256;
 		}
+	} else if (effectiveModelId) {
+		payload.modelId = effectiveModelId;
+	}
+
+	payload.method = method || "full";
+	if (prepared) {
+		payload.datasetSizeBytes = prepared.sizeBytes;
+		payload.datasetFingerprint = prepared.sha256;
+		payload.fileCount = prepared.fileCount;
 	}
 
 	console.log(
@@ -1520,15 +1697,16 @@ async function handlePermit(
 			console.error(
 				'[Error] Authentication session expired. Please run "vivacious login anirudha-s" again.'
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return false;
 		}
 
-		const data: any = await response.json();
+		const data: any = await response.json().catch(() => ({}));
 		if (!response.ok) {
-			console.error(
-				`\n[Error] Permit check failed: ${data.error || "Unknown error"}`
-			);
-			process.exit(1);
+			const errMsg = formatApiError(data);
+			console.error(`\n[Error] Permit check failed: ${errMsg}`);
+			process.exitCode = 1;
+			return false;
 		}
 
 		console.log("\n=============================================");
@@ -1640,7 +1818,8 @@ async function handlePermit(
 		console.error(
 			`\n[Error] Failed to connect to orchestrator: ${err.message}`
 		);
-		process.exit(1);
+		process.exitCode = 1;
+		return false;
 	}
 }
 
@@ -1982,13 +2161,18 @@ async function handleDeploy(
 	checkpointPath?: string
 ) {
 	const accessToken = await getValidAccessToken();
+	if (!accessToken) {
+		process.exitCode = 1;
+		return;
+	}
 	let config = loadConfig();
 
 	const prepared = config.preparedDataset;
 	if (!prepared) {
 		console.error("[Error] No dataset has been prepared for upload.");
 		console.error("Run: vivacious prepare <path-to-dataset>");
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 
 	if (checkpointPath) {
@@ -2003,7 +2187,8 @@ async function handleDeploy(
 			console.error(
 				"[Error] Pre-flight financial check rejected or unconfirmed."
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 		config = loadConfig();
 	}
@@ -2014,7 +2199,8 @@ async function handleDeploy(
 			"[Error] No active financial permit found. Please run permit first:"
 		);
 		console.error("  vivacious permit anirudha-s ambition --model <model-id>");
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 
 	if (permit.expiresAt && new Date(permit.expiresAt).getTime() < Date.now()) {
@@ -2028,7 +2214,8 @@ async function handleDeploy(
 		);
 		if (!permitted) {
 			console.error("[Error] Re-permitting failed.");
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 		config = loadConfig();
 	}
@@ -2042,7 +2229,7 @@ async function handleDeploy(
 			headers: { Authorization: `Bearer ${accessToken}` },
 		});
 		if (balRes.ok) {
-			const balData: any = await balRes.json();
+			const balData: any = await balRes.json().catch(() => ({}));
 			const currentBalance = Number(
 				balData.currentBalance ?? balData.current_balance ?? 0
 			);
@@ -2063,7 +2250,8 @@ async function handleDeploy(
 					"Please recharge your balance via the Dashboard (Billing) before deploying."
 				);
 				console.error("=============================================");
-				process.exit(1);
+				process.exitCode = 1;
+				return;
 			}
 
 			if (
@@ -2133,6 +2321,8 @@ async function handleDeploy(
 				modelId: activePermit.modelId,
 				modelSource: checkpointKey ? "custom_checkpoint" : "hf",
 				checkpointKey: checkpointKey,
+				checkpointConfig: prepCheckpoint?.modelConfig,
+				checkpointFingerprint: prepCheckpoint?.sha256,
 				method: activePermit.method,
 				datasetFilename: prepared!.filename,
 				datasetSizeBytes: prepared!.sizeBytes,
@@ -2143,12 +2333,13 @@ async function handleDeploy(
 			}),
 		});
 
-		const deployData: any = await deployRes.json();
+		const deployData: any = await deployRes.json().catch(() => ({}));
 		if (!deployRes.ok) {
 			console.error(
-				`\n[Deployment Error] ${deployData.error || "Server failed to provision instance."}`
+				`\n[Deployment Error] ${formatApiError(deployData) || "Server failed to provision instance."}`
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 
 		console.log("\n=============================================");
@@ -2196,13 +2387,18 @@ async function handleDeploy(
 		saveConfig(config);
 	} catch (submitErr: any) {
 		console.error(`\n[Deployment Communication Error] ${submitErr.message}`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 }
 
 // 5. Query Real-Time Balance
 async function handleBalance() {
 	const accessToken = await getValidAccessToken();
+	if (!accessToken) {
+		process.exitCode = 1;
+		return;
+	}
 
 	try {
 		const res = await fetch(`${API_HOST}/api/user/balance`, {
@@ -2215,13 +2411,15 @@ async function handleBalance() {
 				console.error(
 					'Please run "vivacious login anirudha-s" to authenticate.\n'
 				);
-				process.exit(1);
+				process.exitCode = 1;
+				return;
 			}
 			const errJson: any = await res.json().catch(() => ({}));
 			console.error(
-				`[Error] Failed to fetch balance: ${errJson.error || res.statusText}`
+				`[Error] Failed to fetch balance: ${formatApiError(errJson) || res.statusText}`
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 
 		const data: any = await res.json();
@@ -2246,13 +2444,18 @@ async function handleBalance() {
 		console.log("=============================================");
 	} catch (err: any) {
 		console.error(`[Error] Could not retrieve balance: ${err.message}`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 }
 
 // 6. Query Job Status & Live Telemetry
 async function handleStatus(jobId?: string) {
 	const accessToken = await getValidAccessToken();
+	if (!accessToken) {
+		process.exitCode = 1;
+		return;
+	}
 
 	const endpoint = jobId
 		? `${API_HOST}/api/jobs/${jobId}`
@@ -2273,8 +2476,10 @@ async function handleStatus(jobId?: string) {
 		}
 
 		if (!res.ok) {
-			console.error(`[Error] Failed to fetch status: ${res.statusText}`);
-			process.exit(1);
+			const errJson: any = await res.json().catch(() => ({}));
+			console.error(`[Error] Failed to fetch status: ${formatApiError(errJson) || res.statusText}`);
+			process.exitCode = 1;
+			return;
 		}
 
 		const data: any = await res.json();
@@ -2305,13 +2510,18 @@ async function handleStatus(jobId?: string) {
 		console.log("=============================================");
 	} catch (err: any) {
 		console.error(`[Error] Could not retrieve status: ${err.message}`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 }
 
 // 6b. Query Live Execution Logs & Output Telemetry
 async function handleLogs(jobId?: string) {
 	const accessToken = await getValidAccessToken();
+	if (!accessToken) {
+		process.exitCode = 1;
+		return;
+	}
 
 	const endpoint = jobId
 		? `${API_HOST}/api/jobs/${jobId}`
@@ -2332,10 +2542,12 @@ async function handleLogs(jobId?: string) {
 		}
 
 		if (!res.ok) {
+			const errJson: any = await res.json().catch(() => ({}));
 			console.error(
-				`[Error] Failed to fetch execution logs: ${res.statusText}`
+				`[Error] Failed to fetch execution logs: ${formatApiError(errJson) || res.statusText}`
 			);
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 
 		const data: any = await res.json();
@@ -2377,7 +2589,8 @@ async function handleLogs(jobId?: string) {
 		console.log("=============================================");
 	} catch (err: any) {
 		console.error(`[Error] Could not retrieve execution logs: ${err.message}`);
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 }
 
@@ -2528,7 +2741,8 @@ async function handleResumeInspect(jobId: string) {
 		console.error("[Error] Missing required parameter: <job-id>");
 		console.error("Usage: vivacious resume <job-id>");
 		console.error("Example: vivacious resume job_8f29ab01");
-		process.exit(1);
+		process.exitCode = 1;
+		return;
 	}
 
 	console.log(`\n=============================================`);
@@ -2544,10 +2758,10 @@ async function handleResumeInspect(jobId: string) {
 			}
 		);
 
-		const data: any = await res.json();
+		const data: any = await res.json().catch(() => ({}));
 		if (!res.ok || !data.success || !data.resumeAvailable) {
 			console.error(
-				`\n[Inspection Error] ${data.error || "Workload is not eligible for resumption."}`
+				`\n[Inspection Error] ${formatApiError(data) || "Workload is not eligible for resumption."}`
 			);
 			process.exitCode = 1;
 			return;
@@ -2633,10 +2847,10 @@ async function handleResumeCheck() {
 			}),
 		});
 
-		const data: any = await res.json();
+		const data: any = await res.json().catch(() => ({}));
 		if (!res.ok) {
 			console.error(
-				`\n[Permit Error] ${data.error || "Server failed to calculate resume permit."}`
+				`\n[Permit Error] ${formatApiError(data) || "Server failed to calculate resume permit."}`
 			);
 			process.exitCode = 1;
 			return;
@@ -2751,10 +2965,10 @@ async function handleResumeBegin(autoConfirm: boolean = false) {
 			}),
 		});
 
-		const data: any = await res.json();
+		const data: any = await res.json().catch(() => ({}));
 		if (!res.ok || !data.success) {
 			console.error(
-				`\n[Deployment Error] ${data.error || "Server failed to resume workload."}`
+				`\n[Deployment Error] ${formatApiError(data) || "Server failed to resume workload."}`
 			);
 			process.exitCode = 1;
 			return;
