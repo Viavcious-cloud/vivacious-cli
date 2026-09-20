@@ -10,6 +10,7 @@
     "lint": "eslint --config ../eslint.config.js src --max-warnings 0",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "ts-node tests/test-targeted-fixes.ts",
     "start": "ts-node src/index.ts"
   },
   "devDependencies": {
