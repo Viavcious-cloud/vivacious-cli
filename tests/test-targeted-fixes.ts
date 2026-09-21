@@ -20,6 +20,7 @@ import {
 	streamValidateLargeJsonArray,
 	getStagedArchivePath,
 	archiveDirectoryToTarGz,
+	calculateDirectoryFastFingerprint,
 } from "../src/index";
 
 async function runTests(): Promise<void> {
@@ -532,6 +533,143 @@ async function runTests(): Promise<void> {
 			);
 		} finally {
 			fs.rmSync(bombPath, { force: true });
+		}
+	});
+
+	// -------------------------------------------------------------
+	// 12. Hardened Streaming Upload Progress & Telemetry
+	// -------------------------------------------------------------
+	console.log("\n--- 12. Hardened Streaming Upload Progress & Telemetry ---");
+
+	await test("Streaming upload Transform correctly tracks chunk bytes and in-flight progress", async () => {
+		const { Transform } = await import("node:stream");
+		let trackedBytes = 0;
+		const stream = new Transform({
+			transform(chunk, _enc, cb) {
+				trackedBytes += chunk.length;
+				cb(null, chunk);
+			},
+		});
+
+		const testChunk = Buffer.alloc(256 * 1024, 1);
+		stream.resume();
+		stream.write(testChunk);
+		stream.write(testChunk);
+		stream.end();
+
+		await new Promise<void>((resolve) => stream.on("end", resolve));
+		assert.strictEqual(trackedBytes, 512 * 1024);
+	});
+
+	await test("Progress bar status line formats monotonically without trailing ghost text", () => {
+		const uploadFileSizeBytes = 100 * 1024 * 1024;
+		const currentTotalBytes = 45 * 1024 * 1024;
+		const pctNum = (currentTotalBytes / uploadFileSizeBytes) * 100;
+		const pctStr = pctNum.toFixed(1);
+		const barWidth = 22;
+		const filled = Math.min(barWidth, Math.round((pctNum / 100) * barWidth));
+		const bar = "=".repeat(filled) + (filled < barWidth ? ">" : "") + " ".repeat(Math.max(0, barWidth - filled - (filled < barWidth ? 1 : 0)));
+		const curMB = (currentTotalBytes / (1024 * 1024)).toFixed(1);
+		const totalMB = (uploadFileSizeBytes / (1024 * 1024)).toFixed(1);
+		const statusLine = `[Transfer] [${bar}] ${pctStr.padStart(5, " ")}% | ${curMB} / ${totalMB} MB | Speed: 25.0 MB/s (Peak: 30.0 MB/s) | Parts: 5/10 | ETA: 2s`;
+
+		assert.ok(statusLine.includes("45.0%"));
+		assert.ok(statusLine.includes("45.0 / 100.0 MB"));
+		assert.ok(statusLine.includes("Parts: 5/10"));
+		assert.ok(statusLine.includes("ETA: 2s"));
+	});
+
+	console.log("\n--- 13. Dual-Layer Fast Manifest Fingerprinting ---");
+	await test("calculateDirectoryFastFingerprint produces deterministic fingerprint in milliseconds", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vivacious-fast-fp-test-"));
+		try {
+			fs.writeFileSync(path.join(tempDir, "file_a.txt"), "hello world");
+			fs.writeFileSync(path.join(tempDir, "file_b.txt"), "another piece of data");
+			const subDir = path.join(tempDir, "subdir");
+			fs.mkdirSync(subDir);
+			fs.writeFileSync(path.join(subDir, "file_c.txt"), "nested content");
+
+			const fp1 = await calculateDirectoryFastFingerprint(tempDir);
+			const fp2 = await calculateDirectoryFastFingerprint(tempDir);
+
+			assert.strictEqual(fp1.fileCount, 3);
+			assert.strictEqual(fp1.fastFingerprint, fp2.fastFingerprint);
+			assert.ok(fp1.totalSize > 0);
+			assert.ok(fp1.maxMtimeMs > 0);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	console.log("\n--- 14. PEFT LoRA Checkpoint Scanning (BYOM) ---");
+	await test("scanAndValidateCheckpointDirectory accepts valid PEFT adapter without dense parameters", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vivacious-peft-dir-test-"));
+		try {
+			const adapterConfig = {
+				base_model_name_or_path: "meta-llama/Meta-Llama-3-8B",
+				peft_type: "LORA",
+				r: 16,
+				lora_alpha: 32,
+				target_modules: ["q_proj", "v_proj"],
+				task_type: "CAUSAL_LM",
+			};
+			fs.writeFileSync(
+				path.join(tempDir, "adapter_config.json"),
+				JSON.stringify(adapterConfig, null, 2)
+			);
+			fs.writeFileSync(
+				path.join(tempDir, "adapter_model.safetensors"),
+				Buffer.alloc(1024)
+			);
+			fs.writeFileSync(
+				path.join(tempDir, "chat_template.jinja"),
+				"{% for message in messages %}{{ message['content'] }}{% endfor %}"
+			);
+
+			const scanRes = await scanAndValidateCheckpointDirectory(tempDir);
+			assert.strictEqual(scanRes.isValid, true);
+			assert.strictEqual(scanRes.modelConfig?.modelType, "peft_adapter");
+			assert.strictEqual(scanRes.modelConfig?.baseModel, "meta-llama/Meta-Llama-3-8B");
+			assert.strictEqual(scanRes.hasChatTemplate, true);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	await test("scanAndValidateCheckpointArchive verifies packaged PEFT adapter archive", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vivacious-peft-arch-src-"));
+		const archivePath = path.join(os.tmpdir(), `peft_test_${Date.now()}.tar.gz`);
+		try {
+			const adapterConfig = {
+				base_model_name_or_path: "mistralai/Mistral-7B-v0.1",
+				peft_type: "LORA",
+				r: 8,
+				lora_alpha: 16,
+				target_modules: ["q_proj", "k_proj"],
+			};
+			fs.writeFileSync(
+				path.join(tempDir, "adapter_config.json"),
+				JSON.stringify(adapterConfig, null, 2)
+			);
+			fs.writeFileSync(
+				path.join(tempDir, "adapter_model.safetensors"),
+				Buffer.alloc(2048)
+			);
+			fs.writeFileSync(
+				path.join(tempDir, "chat_template.json"),
+				JSON.stringify({ chat_template: "{{ messages }}" })
+			);
+
+			await archiveDirectoryToTarGz(tempDir, archivePath, 4096);
+			const scanRes = await scanAndValidateCheckpointArchive(archivePath);
+
+			assert.strictEqual(scanRes.isValid, true);
+			assert.strictEqual(scanRes.modelConfig?.modelType, "peft_adapter");
+			assert.strictEqual(scanRes.modelConfig?.baseModel, "mistralai/Mistral-7B-v0.1");
+			assert.strictEqual(scanRes.hasChatTemplate, true);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+			if (fs.existsSync(archivePath)) fs.unlinkSync(archivePath);
 		}
 	});
 

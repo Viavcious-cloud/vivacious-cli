@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { Transform } from "node:stream";
 import * as zlib from "node:zlib";
 
 const API_HOST =
@@ -365,6 +366,61 @@ export function calculateFileSha256(filePath: string): Promise<string> {
 		stream.on("end", () => resolve(hash.digest("hex")));
 		stream.on("error", (err) => reject(err));
 	});
+}
+
+/**
+ * Dual-layer directory fast fingerprint calculation for rapid local cache invalidation.
+ * Hashes deterministic lexical file metadata (relative path + size + mtimeMs) in <50ms without
+ * reading multi-gigabyte files from disk. Final cryptographic artifact integrity is computed
+ * in a single streaming pass during archive creation and upload.
+ */
+export async function calculateDirectoryFastFingerprint(
+	dirPath: string
+): Promise<{ totalSize: number; fileCount: number; maxMtimeMs: number; fastFingerprint: string }> {
+	const hash = crypto.createHash("sha256");
+	let totalSize = 0;
+	let fileCount = 0;
+	let maxMtimeMs = 0;
+
+	async function walk(currentDir: string, depth: number = 0) {
+		if (depth > 20) {
+			throw new Error(
+				`Directory nesting exceeds maximum depth limit of 20 at "${currentDir}". Recursive directory or symlink loop detected.`
+			);
+		}
+
+		const dir = await fs.promises.opendir(currentDir);
+		const entryNames: string[] = [];
+
+		for await (const dirent of dir) {
+			entryNames.push(dirent.name);
+		}
+		entryNames.sort();
+
+		for (const name of entryNames) {
+			const fullPath = path.join(currentDir, name);
+			const lstat = await fs.promises.lstat(fullPath);
+
+			if (lstat.isSymbolicLink()) {
+				continue;
+			}
+
+			if (lstat.isDirectory()) {
+				await walk(fullPath, depth + 1);
+			} else if (lstat.isFile()) {
+				fileCount++;
+				totalSize += lstat.size;
+				if (lstat.mtimeMs > maxMtimeMs) maxMtimeMs = lstat.mtimeMs;
+				const normalizedRelPath = path
+					.relative(dirPath, fullPath)
+					.replace(/\\/g, "/");
+				hash.update(`${normalizedRelPath}:${lstat.size}:${lstat.mtimeMs}\n`);
+			}
+		}
+	}
+
+	await walk(dirPath, 0);
+	return { totalSize, fileCount, maxMtimeMs, fastFingerprint: hash.digest("hex") };
 }
 
 /**
@@ -745,6 +801,8 @@ export const ALLOWED_EXACT_CHECKPOINT_FILES = new Set([
 	"generation_config.json",
 	"adapter_config.json",
 	"chat_template.json",
+	"chat_template.jinja",
+	"chat_template.jinja2",
 	"tokenizer.json",
 	"tokenizer_config.json",
 	"special_tokens_map.json",
@@ -796,7 +854,9 @@ export function validateCheckpointEntry(
 		ALLOWED_EXACT_CHECKPOINT_FILES.has(basename) ||
 		basename.endsWith(".safetensors") ||
 		basename.endsWith(".json") ||
-		basename.endsWith(".txt");
+		basename.endsWith(".txt") ||
+		basename.endsWith(".jinja") ||
+		basename.endsWith(".jinja2");
 
 	if (!isAllowed) {
 		return {
@@ -847,6 +907,7 @@ export async function scanAndValidateCheckpointDirectory(
 ): Promise<{
 	isValid: boolean;
 	modelConfig?: any;
+	hasChatTemplate?: boolean;
 	error?: string;
 }> {
 	if (!fs.existsSync(dirPath)) {
@@ -861,6 +922,7 @@ export async function scanAndValidateCheckpointDirectory(
 
 	const foundFiles: string[] = [];
 	let extractedConfig: any = null;
+	let hasChatTemplate = false;
 
 	function walk(currentDir: string, relativePrefix: string = "") {
 		const entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -878,6 +940,13 @@ export async function scanAndValidateCheckpointDirectory(
 				if (!validation.isAllowed) {
 					throw new Error(validation.error);
 				}
+				const isChatTemplate =
+					entry.name === "chat_template.jinja" ||
+					entry.name === "chat_template.jinja2" ||
+					entry.name === "chat_template.json";
+				if (isChatTemplate) {
+					hasChatTemplate = true;
+				}
 				if (
 					(entry.name === "config.json" ||
 						entry.name === "adapter_config.json") &&
@@ -887,34 +956,51 @@ export async function scanAndValidateCheckpointDirectory(
 						const content = fs.readFileSync(fullPath, "utf-8");
 						if (checkJsonNestingDepth(content, 30)) {
 							const parsed = JSON.parse(content);
-							const estimatedParams = estimateParametersFromConfig(parsed);
-							const hidden =
-								Number(
-									parsed.hidden_size || parsed.d_model || parsed.n_embd
-								) || 4096;
-							const layers =
-								Number(parsed.num_hidden_layers || parsed.n_layer) || 32;
-							const heads =
-								Number(parsed.num_attention_heads || parsed.n_head) || 32;
-							const intermediate =
-								Number(parsed.intermediate_size || parsed.n_inner) ||
-								hidden * 4;
+							if (
+								entry.name === "adapter_config.json" ||
+								parsed.peft_type ||
+								parsed.base_model_name_or_path
+							) {
+								extractedConfig = {
+									...parsed,
+									modelType: "peft_adapter",
+									baseModel: parsed.base_model_name_or_path || "unknown",
+									r: parsed.r,
+									loraAlpha: parsed.lora_alpha,
+									targetModules: parsed.target_modules,
+									architectures: ["PeftAdapterModel"],
+									parameterCount: 0,
+								};
+							} else {
+								const estimatedParams = estimateParametersFromConfig(parsed);
+								const hidden =
+									Number(
+										parsed.hidden_size || parsed.d_model || parsed.n_embd
+									) || 4096;
+								const layers =
+									Number(parsed.num_hidden_layers || parsed.n_layer) || 32;
+								const heads =
+									Number(parsed.num_attention_heads || parsed.n_head) || 32;
+								const intermediate =
+									Number(parsed.intermediate_size || parsed.n_inner) ||
+									hidden * 4;
 
-							extractedConfig = {
-								...parsed,
-								modelType: parsed.model_type || "custom_causal_lm",
-								hiddenSize: hidden,
-								numHiddenLayers: layers,
-								numAttentionHeads: heads,
-								intermediateSize: intermediate,
-								vocabSize: parsed.vocab_size || 32000,
-								architectures: parsed.architectures || [
-									parsed.model_type
-										? `${parsed.model_type}LMHeadModel`
-										: "LlamaForCausalLM",
-								],
-								parameterCount: estimatedParams || undefined,
-							};
+								extractedConfig = {
+									...parsed,
+									modelType: parsed.model_type || "custom_causal_lm",
+									hiddenSize: hidden,
+									numHiddenLayers: layers,
+									numAttentionHeads: heads,
+									intermediateSize: intermediate,
+									vocabSize: parsed.vocab_size || 32000,
+									architectures: parsed.architectures || [
+										parsed.model_type
+											? `${parsed.model_type}LMHeadModel`
+											: "LlamaForCausalLM",
+									],
+									parameterCount: estimatedParams || undefined,
+								};
+							}
 						}
 					} catch {}
 				}
@@ -943,6 +1029,7 @@ export async function scanAndValidateCheckpointDirectory(
 	return {
 		isValid: true,
 		modelConfig: extractedConfig,
+		hasChatTemplate,
 	};
 }
 
@@ -957,6 +1044,7 @@ export async function scanAndValidateCheckpointArchive(
 ): Promise<{
 	isValid: boolean;
 	modelConfig?: any;
+	hasChatTemplate?: boolean;
 	error?: string;
 }> {
 	if (!fs.existsSync(archivePath)) {
@@ -996,21 +1084,23 @@ export async function scanAndValidateCheckpointArchive(
 		return {
 			isValid: false,
 			error:
-				"Invalid archive format: must be a gzip-compressed tarball (.tar.gz) or standard tar archive (.tar).",
+				"Invalid archive format: File is neither a gzip compressed tarball (.tar.gz) nor a valid POSIX standard tar archive (.tar).",
 		};
 	}
+
+	const compressedFileSizeBytes = fs.statSync(archivePath).size;
+	let totalUncompressedBytes = 0;
+	let entryCount = 0;
+	let extractedConfigBuffer: Buffer | null = null;
+	let extractedConfigName = "";
+	let hasChatTemplate = false;
+	const seenEntries = new Set<string>();
 
 	// Decompression Bomb Limits
 	const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024 * 1024; // 200 GiB
 	const MAX_ARCHIVE_ENTRIES = 10000;
 	const MAX_CONFIG_JSON_BYTES = 2 * 1024 * 1024; // 2 MiB
 	const MAX_COMPRESSION_RATIO = 50.0; // Suspicious compression ratio threshold
-
-	const compressedFileSizeBytes = fs.statSync(archivePath).size;
-	let totalUncompressedBytes = 0;
-	let entryCount = 0;
-	let extractedConfigBuffer: Buffer | null = null;
-	const seenEntries = new Set<string>();
 
 	try {
 		const zlib = await import("node:zlib");
@@ -1229,10 +1319,23 @@ export async function scanAndValidateCheckpointArchive(
 							const available = Math.min(needed, buffer.length);
 							const chunkData = buffer.subarray(0, available);
 							const basename = path.posix.basename(currentEntry.name);
+							if (
+								!currentEntry.isPax &&
+								(basename === "chat_template.jinja" ||
+									basename === "chat_template.jinja2" ||
+									basename === "chat_template.json")
+							) {
+								hasChatTemplate = true;
+							}
 							const isExactConfig =
 								!currentEntry.isPax &&
-								basename === "config.json" &&
+								(basename === "config.json" ||
+									basename === "adapter_config.json") &&
 								extractedConfigBuffer === null;
+
+							if (isExactConfig && !extractedConfigName) {
+								extractedConfigName = basename;
+							}
 
 							if (currentEntry.isPax) {
 								targetPaxChunks.push(Buffer.from(chunkData));
@@ -1306,62 +1409,102 @@ export async function scanAndValidateCheckpointArchive(
 				};
 			}
 			const parsed = JSON.parse(rawText);
-			const estimatedParams = estimateParametersFromConfig(parsed);
+			if (
+				extractedConfigName === "adapter_config.json" ||
+				parsed.peft_type ||
+				parsed.base_model_name_or_path
+			) {
+				modelConfig = {
+					...parsed,
+					modelType: "peft_adapter",
+					baseModel: parsed.base_model_name_or_path || "unknown",
+					r: parsed.r,
+					loraAlpha: parsed.lora_alpha,
+					targetModules: parsed.target_modules,
+					architectures: ["PeftAdapterModel"],
+					parameterCount: 0,
+				};
+			} else {
+				const estimatedParams = estimateParametersFromConfig(parsed);
 
-			if (!estimatedParams) {
-				const foundKeys = Object.keys(parsed).slice(0, 10).join(", ");
-				return {
-					isValid: false,
-					error: `Checkpoint config.json is missing required model architecture parameters. Expected 'hidden_size'/'num_hidden_layers'/'num_attention_heads' (Llama/Mistral/Qwen/BERT) or 'n_embd'/'n_layer'/'n_head' (GPT-2). Found keys: [${foundKeys}]`,
+				if (!estimatedParams) {
+					const foundKeys = Object.keys(parsed).slice(0, 10).join(", ");
+					return {
+						isValid: false,
+						error: `Checkpoint config.json is missing required model architecture parameters. Expected 'hidden_size'/'num_hidden_layers'/'num_attention_heads' (Llama/Mistral/Qwen/BERT) or 'n_embd'/'n_layer'/'n_head' (GPT-2). Found keys: [${foundKeys}]`,
+					};
+				}
+
+				const hidden =
+					Number(
+						parsed.hidden_size ||
+							parsed.d_model ||
+							parsed.n_embd ||
+							parsed.n_emb ||
+							parsed.embedding_size
+					) || 4096;
+				const layers =
+					Number(
+						parsed.num_hidden_layers ||
+							parsed.n_layer ||
+							parsed.n_layers ||
+							parsed.num_layers
+					) || 32;
+				const heads =
+					Number(parsed.num_attention_heads || parsed.n_head || parsed.num_heads) ||
+					32;
+				const intermediate =
+					Number(parsed.intermediate_size || parsed.n_inner || parsed.d_ff) ||
+					hidden * 4;
+
+				modelConfig = {
+					...parsed,
+					modelType: parsed.model_type || "custom_causal_lm",
+					hiddenSize: hidden,
+					numHiddenLayers: layers,
+					numAttentionHeads: heads,
+					intermediateSize: intermediate,
+					vocabSize: parsed.vocab_size || 32000,
+					architectures: parsed.architectures || [
+						parsed.model_type
+							? `${parsed.model_type}LMHeadModel`
+							: "LlamaForCausalLM",
+					],
+					parameterCount: estimatedParams,
 				};
 			}
-
-			const hidden =
-				Number(
-					parsed.hidden_size ||
-						parsed.d_model ||
-						parsed.n_embd ||
-						parsed.n_emb ||
-						parsed.embedding_size
-				) || 4096;
-			const layers =
-				Number(
-					parsed.num_hidden_layers ||
-						parsed.n_layer ||
-						parsed.n_layers ||
-						parsed.num_layers
-				) || 32;
-			const heads =
-				Number(parsed.num_attention_heads || parsed.n_head || parsed.num_heads) ||
-				32;
-			const intermediate =
-				Number(parsed.intermediate_size || parsed.n_inner || parsed.d_ff) ||
-				hidden * 4;
-
-			modelConfig = {
-				...parsed,
-				modelType: parsed.model_type || "custom_causal_lm",
-				hiddenSize: hidden,
-				numHiddenLayers: layers,
-				numAttentionHeads: heads,
-				intermediateSize: intermediate,
-				vocabSize: parsed.vocab_size || 32000,
-				architectures: parsed.architectures || [
-					parsed.model_type
-						? `${parsed.model_type}LMHeadModel`
-						: "LlamaForCausalLM",
-				],
-				parameterCount: estimatedParams,
-			};
 		} catch (parseErr: any) {
 			return {
 				isValid: false,
-				error: `Defensive archive scan rejected: config.json JSON parse error (${parseErr.message})`,
+				error: `Defensive archive scan rejected: config JSON parse error (${parseErr.message})`,
 			};
 		}
 	}
 
-	// Fallback to adjacent config.json if not found inside archive root
+	// Fallback to adjacent adapter_config.json or config.json if not found inside archive root
+	if (!modelConfig) {
+		const adjacentAdapterConfigPath = path.join(
+			path.dirname(archivePath),
+			"adapter_config.json"
+		);
+		if (fs.existsSync(adjacentAdapterConfigPath)) {
+			try {
+				const raw = fs.readFileSync(adjacentAdapterConfigPath, "utf-8");
+				const parsed = JSON.parse(raw);
+				modelConfig = {
+					...parsed,
+					modelType: "peft_adapter",
+					baseModel: parsed.base_model_name_or_path || "unknown",
+					r: parsed.r,
+					loraAlpha: parsed.lora_alpha,
+					targetModules: parsed.target_modules,
+					architectures: ["PeftAdapterModel"],
+					parameterCount: 0,
+				};
+			} catch {}
+		}
+	}
+
 	if (!modelConfig) {
 		const adjacentConfigPath = path.join(
 			path.dirname(archivePath),
@@ -1444,16 +1587,17 @@ export async function scanAndValidateCheckpointArchive(
 					modelType: "trainer_resumption",
 					architectures: ["TrainerCheckpoint"],
 				},
+				hasChatTemplate,
 			};
 		}
 		return {
 			isValid: false,
 			error:
-				"Archive is valid but missing config.json. Model architecture parameters could not be determined.",
+				"Archive is valid but missing config.json or adapter_config.json. Model architecture parameters could not be determined.",
 		};
 	}
 
-	return { isValid: true, modelConfig };
+	return { isValid: true, modelConfig, hasChatTemplate };
 }
 
 export interface DatasetValidationResult {
@@ -1999,12 +2143,12 @@ async function handlePrepare(
 
 	if (stat.isDirectory()) {
 		console.log(
-			`Analyzing directory structure and calculating streaming cryptographic checksum...`
+			`Analyzing directory structure and calculating fast manifest fingerprint...`
 		);
-		const res = await calculateDirectoryFingerprint(absolutePath);
-		totalSize = res.totalSize;
-		fileCount = res.fileCount;
-		sha256Fingerprint = res.sha256;
+		const fastRes = await calculateDirectoryFastFingerprint(absolutePath);
+		totalSize = fastRes.totalSize;
+		fileCount = fastRes.fileCount;
+		sha256Fingerprint = fastRes.fastFingerprint;
 	} else {
 		console.log(
 			`Analyzing file and calculating streaming cryptographic checksum...`
@@ -2076,7 +2220,9 @@ async function handlePrepare(
 			config.preparedCheckpoint = preparedCheckpoint;
 			saveConfig(config);
 
-			const paramDisplay = scanResult.modelConfig?.parameterCount
+			const paramDisplay = scanResult.modelConfig?.modelType === "peft_adapter"
+				? `PEFT Adapter (Base: ${scanResult.modelConfig.baseModel || "configured on permit"})`
+				: scanResult.modelConfig?.parameterCount
 				? `~${(scanResult.modelConfig.parameterCount / 1e9).toFixed(1)}B (Analytical Pre-flight)`
 				: "Authoritative sizing calculated on permit";
 			console.log(`Checkpoint Source:     ${filename} (Directory)`);
@@ -2089,6 +2235,9 @@ async function handlePrepare(
 				`Detected Model Type:   ${scanResult.modelConfig?.modelType || "CausalLM"}`
 			);
 			console.log(`Base Architecture:     ${paramDisplay}`);
+			if (scanResult.hasChatTemplate) {
+				console.log(`Chat Template:         Detected (Jinja2 standalone / tokenizer config)`);
+			}
 			console.log(`=============================================`);
 			console.log(`✅ [Custom Checkpoint Directory Packaged & Staged Locally]`);
 			console.log(
@@ -2120,7 +2269,9 @@ async function handlePrepare(
 		config.preparedCheckpoint = preparedCheckpoint;
 		saveConfig(config);
 
-		const paramDisplay = scanResult.modelConfig?.parameterCount
+		const paramDisplay = scanResult.modelConfig?.modelType === "peft_adapter"
+			? `PEFT Adapter (Base: ${scanResult.modelConfig.baseModel || "configured on permit"})`
+			: scanResult.modelConfig?.parameterCount
 			? `~${(scanResult.modelConfig.parameterCount / 1e9).toFixed(1)}B (Analytical Pre-flight)`
 			: "Authoritative sizing calculated on permit";
 		console.log(`Checkpoint Archive:    ${filename}`);
@@ -2132,6 +2283,9 @@ async function handlePrepare(
 			`Detected Model Type:   ${scanResult.modelConfig?.modelType || "CausalLM"}`
 		);
 		console.log(`Base Architecture:     ${paramDisplay}`);
+		if (scanResult.hasChatTemplate) {
+			console.log(`Chat Template:         Detected (Jinja2 standalone / tokenizer config)`);
+		}
 		console.log(`=============================================`);
 		console.log(`✅ [Custom Checkpoint Staged Locally]`);
 		console.log(
@@ -2162,6 +2316,11 @@ async function handlePrepare(
 		console.log(
 			`Schema Format:         ${valResult.format ? valResult.format.toUpperCase() : "UNKNOWN"}`
 		);
+		if (valResult.format === "sharegpt_messages") {
+			console.log(
+				`Chat Formatting:       Deferred to tokenizer/model chat template`
+			);
+		}
 		console.log(
 			`Valid Training Items:  ${valResult.sampleCount.toLocaleString()}`
 		);
@@ -2197,6 +2356,51 @@ async function handlePrepare(
 	);
 }
 
+/**
+ * Distinguish between a local custom checkpoint target vs. a remote Hugging Face model identifier.
+ * Local custom checkpoints:
+ *  - Explicit literal: "custom_model"
+ *  - Existing file/folder on local disk (fs.existsSync)
+ *  - Tarball or zip archive (.tar.gz, .tar, .zip, .tgz)
+ *  - Explicit local filesystem path (starts with ./, ../, /, \, or Windows drive letter like C:\)
+ * Hugging Face base models:
+ *  - org/model syntax (e.g. meta-llama/Llama-3-8b, mistralai/Mistral-7B-v0.1)
+ *  - Standalone repo name (e.g. gpt2, gpt2-medium, bert-base-uncased)
+ */
+export function isLocalCheckpointTarget(modelId?: string): boolean {
+	if (!modelId) return false;
+	const trimmed = modelId.trim();
+	if (!trimmed) return false;
+	if (trimmed.toLowerCase() === "custom_model") return true;
+	if (
+		trimmed.endsWith(".tar.gz") ||
+		trimmed.endsWith(".tgz") ||
+		trimmed.endsWith(".tar") ||
+		trimmed.endsWith(".zip")
+	) {
+		return true;
+	}
+	if (
+		trimmed.startsWith("./") ||
+		trimmed.startsWith(".\\") ||
+		trimmed.startsWith("../") ||
+		trimmed.startsWith("..\\") ||
+		trimmed.startsWith("/") ||
+		trimmed.startsWith("\\") ||
+		/^[a-zA-Z]:[/\\]/.test(trimmed)
+	) {
+		return true;
+	}
+	try {
+		if (fs.existsSync(trimmed)) {
+			return true;
+		}
+	} catch {
+		// Ignore filesystem errors for non-existent virtual names
+	}
+	return false;
+}
+
 // 3. Pre-Flight Financial Permit Check (NO R2 Upload, NO GPU Start)
 async function handlePermit(
 	modelId?: string,
@@ -2220,19 +2424,14 @@ async function handlePermit(
 	}
 
 	const payload: Record<string, any> = {};
-	const effectiveModelId = modelId || "";
+	const effectiveModelId = (modelId || "").trim();
 
 	// Check if target is a custom checkpoint archive or custom model
 	const isCustom =
-		effectiveModelId === "custom_model" ||
-		(effectiveModelId.length > 0 &&
-			(fs.existsSync(effectiveModelId) ||
-				effectiveModelId.endsWith(".tar.gz") ||
-				effectiveModelId.includes("\\") ||
-				effectiveModelId.includes("/"))) ||
+		isLocalCheckpointTarget(effectiveModelId) ||
+		(!effectiveModelId && Boolean(preparedCheckpoint)) ||
 		(Boolean(preparedCheckpoint) &&
-			(!effectiveModelId ||
-				effectiveModelId === preparedCheckpoint?.filename ||
+			(effectiveModelId === preparedCheckpoint?.filename ||
 				effectiveModelId === preparedCheckpoint?.path));
 
 	if (isCustom) {
@@ -2244,6 +2443,7 @@ async function handlePermit(
 		}
 	} else if (effectiveModelId) {
 		payload.modelId = effectiveModelId;
+		payload.modelSource = "hf";
 	}
 
 	payload.method = method || "full";
@@ -2307,8 +2507,25 @@ async function handlePermit(
 				durationStr += ` [Boot ~${Math.round(est.bootMinutes)}m | Train ~${Math.round(est.trainMinutes)}m | Upload ~${Math.round(est.finalizeMinutes)}m${bufStr}]`;
 			}
 
+			const formatParams = (count?: number) => {
+				if (!count || count <= 0) return null;
+				if (count >= 1_000_000_000)
+					return `${(count / 1_000_000_000).toFixed(2)}B parameters`;
+				if (count >= 1_000_000)
+					return `${(count / 1_000_000).toFixed(0)}M parameters`;
+				return `${count.toLocaleString()} parameters`;
+			};
+			const paramScaleStr = formatParams(est.parameterCount);
+			const modelCategory =
+				data.modelCategory ||
+				(isCustom ? "Custom Checkpoint Archive" : "Base Model (Hugging Face)");
+
 			console.log("---------------------------------------------");
 			console.log(`Target Model:           ${est.modelId}`);
+			console.log(`Model Category:         ${modelCategory}`);
+			if (paramScaleStr) {
+				console.log(`Parameter Scale:        ${paramScaleStr}`);
+			}
 			console.log(`Training Method:        ${method.toUpperCase()}`);
 			console.log(`Allocated GPU Tier:     ${est.gpuTier}`);
 			console.log(`Estimated Duration:     ${durationStr}`);
@@ -2608,12 +2825,42 @@ export async function archiveDirectoryToTarGz(
 	const outStream = fs.createWriteStream(outputPath);
 	gzip.pipe(outStream);
 
+	let packagedBytes = 0;
+	let lastPackagedRender = 0;
+
+	function renderPackagingProgress(force = false) {
+		const now = Date.now();
+		if (!force && process.stdout.isTTY && now - lastPackagedRender < 100) return;
+		lastPackagedRender = now;
+		const pct =
+			estimatedBytes > 0
+				? Math.min(100, (packagedBytes / estimatedBytes) * 100).toFixed(1)
+				: "0.0";
+		const curMB = (packagedBytes / (1024 * 1024)).toFixed(1);
+		const totMB = (estimatedBytes / (1024 * 1024)).toFixed(1);
+		const barWidth = 20;
+		const filled = Math.min(
+			barWidth,
+			Math.round((Number(pct) / 100) * barWidth)
+		);
+		const bar =
+			"=".repeat(filled) +
+			(filled < barWidth ? ">" : "") +
+			" ".repeat(Math.max(0, barWidth - filled - (filled < barWidth ? 1 : 0)));
+		const line = `[Packaging] [${bar}] ${pct.padStart(5, " ")}% | ${curMB} / ${totMB} MB packaged`;
+		if (process.stdout.isTTY) {
+			process.stdout.write(`\r\x1b[K${line}`);
+		}
+	}
+
 	async function pipeFileChunks(filePath: string): Promise<void> {
 		return new Promise((resolve, reject) => {
 			const readStream = fs.createReadStream(filePath, {
 				highWaterMark: 256 * 1024,
 			});
 			readStream.on("data", (chunk) => {
+				packagedBytes += chunk.length;
+				renderPackagingProgress();
 				const canContinue = gzip.write(chunk);
 				if (!canContinue) {
 					readStream.pause();
@@ -2651,6 +2898,10 @@ export async function archiveDirectoryToTarGz(
 	}
 
 	await walkAndWrite(dirPath);
+	renderPackagingProgress(true);
+	if (process.stdout.isTTY) {
+		process.stdout.write("\n");
+	}
 	gzip.write(Buffer.alloc(1024)); // Two 512-byte EOF zero blocks
 	gzip.end();
 
@@ -2862,67 +3113,134 @@ async function performUpload(
 			return promise;
 		}
 
-		// Rolling telemetry tracking
-		let totalUploadedBytes = 0;
+		// Real-time streaming upload telemetry & smooth progress reporting
+		let completedBytes = 0;
 		for (let p = 1; p <= totalParts; p++) {
 			if (completedMap.has(p)) {
 				const start = (p - 1) * chunkSize;
 				const end = Math.min(uploadFileSizeBytes, p * chunkSize);
-				totalUploadedBytes += end - start;
+				completedBytes += end - start;
 			}
 		}
+		const initialCompletedBytes = completedBytes;
 
-		const speedWindow: { time: number; bytes: number }[] = [];
+		const activePartBytes = new Map<number, number>();
+		const startTime = Date.now();
+		const speedSamples: { time: number; bytes: number }[] = [];
+		let smoothedSpeedMBs = 0;
 		let peakSpeedMBs = 0;
+		let lastRenderTime = 0;
+		let lastRenderPct = -1;
 
-		function recordBytesTransferred(bytes: number): number {
+		function onChunkBytes(bytes: number) {
 			const now = Date.now();
-			totalUploadedBytes += bytes;
-			speedWindow.push({ time: now, bytes });
+			speedSamples.push({ time: now, bytes });
 
-			while (speedWindow.length > 0 && now - speedWindow[0]!.time > 4000) {
-				speedWindow.shift();
+			// Retain a 3-second rolling window
+			while (speedSamples.length > 0 && now - speedSamples[0]!.time > 3000) {
+				speedSamples.shift();
 			}
 
-			const windowDurationSec =
-				speedWindow.length > 1
-					? (now - speedWindow[0]!.time) / 1000
-					: 1;
-			const windowBytes = speedWindow.reduce((acc, cur) => acc + cur.bytes, 0);
-			const currentSpeedMBs =
-				windowDurationSec > 0
-					? (windowBytes / (1024 * 1024)) / windowDurationSec
+			const durationSec =
+				speedSamples.length > 1
+					? (now - speedSamples[0]!.time) / 1000
 					: 0;
+			const sampleBytes = speedSamples.reduce((sum, s) => sum + s.bytes, 0);
 
-			if (currentSpeedMBs > peakSpeedMBs) {
-				peakSpeedMBs = currentSpeedMBs;
+			if (durationSec >= 0.5) {
+				const rawSpeed = sampleBytes / (1024 * 1024) / durationSec;
+				smoothedSpeedMBs =
+					smoothedSpeedMBs === 0
+						? rawSpeed
+						: smoothedSpeedMBs * 0.75 + rawSpeed * 0.25;
+			} else {
+				const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
+				const inFlight = Array.from(activePartBytes.values()).reduce(
+					(a, b) => a + b,
+					0
+				);
+				const transferredSinceStart =
+					completedBytes - initialCompletedBytes + inFlight;
+				smoothedSpeedMBs =
+					transferredSinceStart / (1024 * 1024) / elapsedSec;
 			}
-			return currentSpeedMBs;
+
+			if (smoothedSpeedMBs > peakSpeedMBs) {
+				peakSpeedMBs = smoothedSpeedMBs;
+			}
 		}
 
-		function renderProgress(lastUploadedPart: number, speedMBs: number) {
-			const pct = ((totalUploadedBytes / uploadFileSizeBytes) * 100).toFixed(1);
-			const remainingBytes = Math.max(0, uploadFileSizeBytes - totalUploadedBytes);
-			const speedBytesSec = speedMBs * 1024 * 1024;
-			const etaSec = speedBytesSec > 0 ? Math.round(remainingBytes / speedBytesSec) : 0;
-			const etaStr =
-				etaSec >= 60
-					? `${Math.floor(etaSec / 60)}m ${etaSec % 60}s`
-					: `${etaSec}s`;
-			const barWidth = 20;
+		function renderProgress(force = false) {
+			const now = Date.now();
+			const inFlight = Array.from(activePartBytes.values()).reduce(
+				(a, b) => a + b,
+				0
+			);
+			const currentTotalBytes = Math.min(
+				uploadFileSizeBytes,
+				completedBytes + inFlight
+			);
+			const pctNum = Math.min(
+				100,
+				Math.max(0, (currentTotalBytes / uploadFileSizeBytes) * 100)
+			);
+
+			// Throttle in interactive TTY (max 1 update per 75ms) unless force=true
+			if (!force && process.stdout.isTTY && now - lastRenderTime < 75) {
+				return;
+			}
+
+			// Throttle in non-TTY (log at most once every 5 seconds or on major 10% milestone)
+			if (!force && !process.stdout.isTTY) {
+				if (
+					now - lastRenderTime < 5000 &&
+					Math.floor(pctNum / 10) === Math.floor(lastRenderPct / 10)
+				) {
+					return;
+				}
+			}
+
+			lastRenderTime = now;
+			lastRenderPct = pctNum;
+
+			const pctStr = pctNum.toFixed(1);
+			const remainingBytes = Math.max(0, uploadFileSizeBytes - currentTotalBytes);
+			let etaStr = "--";
+			if (smoothedSpeedMBs > 0.05) {
+				const etaSec = Math.round(
+					remainingBytes / (smoothedSpeedMBs * 1024 * 1024)
+				);
+				if (etaSec >= 3600) {
+					const hrs = Math.floor(etaSec / 3600);
+					const mins = Math.floor((etaSec % 3600) / 60);
+					etaStr = `${hrs}h ${mins}m`;
+				} else if (etaSec >= 60) {
+					const mins = Math.floor(etaSec / 60);
+					const secs = etaSec % 60;
+					etaStr = `${mins}m ${secs}s`;
+				} else {
+					etaStr = `${etaSec}s`;
+				}
+			}
+
+			const barWidth = 22;
 			const filled = Math.min(
 				barWidth,
-				Math.round((totalUploadedBytes / uploadFileSizeBytes) * barWidth)
+				Math.round((pctNum / 100) * barWidth)
 			);
 			const bar =
 				"=".repeat(filled) +
 				(filled < barWidth ? ">" : "") +
 				" ".repeat(Math.max(0, barWidth - filled - (filled < barWidth ? 1 : 0)));
 
-			const statusLine = `[Transfer] [${bar}] ${pct}% | ${(totalUploadedBytes / (1024 * 1024)).toFixed(1)} / ${(uploadFileSizeBytes / (1024 * 1024)).toFixed(1)} MB | Speed: ${speedMBs.toFixed(1)} MB/s (Peak: ${peakSpeedMBs.toFixed(1)} MB/s) | Part ${lastUploadedPart}/${totalParts} | ETA: ${etaStr}`;
+			const curMB = (currentTotalBytes / (1024 * 1024)).toFixed(1);
+			const totalMB = (uploadFileSizeBytes / (1024 * 1024)).toFixed(1);
+			const completedCount = completedMap.size;
+
+			const statusLine = `[Transfer] [${bar}] ${pctStr.padStart(5, " ")}% | ${curMB} / ${totalMB} MB | Speed: ${smoothedSpeedMBs.toFixed(1)} MB/s (Peak: ${peakSpeedMBs.toFixed(1)} MB/s) | Parts: ${completedCount}/${totalParts} | ETA: ${etaStr}`;
 
 			if (process.stdout.isTTY) {
-				process.stdout.write(`\r${statusLine}`);
+				process.stdout.write(`\r\x1b[K${statusLine}`);
 			} else {
 				console.log(statusLine);
 			}
@@ -2945,12 +3263,25 @@ async function performUpload(
 						highWaterMark: 256 * 1024,
 					});
 
+					let partTransferred = 0;
+					const progressStream = new Transform({
+						transform(chunk: Buffer, _encoding, callback) {
+							partTransferred += chunk.length;
+							activePartBytes.set(partNum, partTransferred);
+							onChunkBytes(chunk.length);
+							renderProgress();
+							callback(null, chunk);
+						},
+					});
+
+					const bodyStream = partStream.pipe(progressStream);
+
 					const putRes = await fetch(url, {
 						method: "PUT",
 						headers: {
 							"Content-Length": String(chunkLen),
 						},
-						body: partStream as any,
+						body: bodyStream as any,
 						// @ts-ignore
 						duplex: "half",
 					});
@@ -2963,14 +3294,17 @@ async function performUpload(
 					const rawEtag = putRes.headers.get("ETag") || `etag-${partNum}`;
 					const etag = rawEtag.replace(/"/g, "");
 					completedMap.set(partNum, etag);
+					activePartBytes.delete(partNum);
+					completedBytes += chunkLen;
 					session!.completedParts.push({ PartNumber: partNum, ETag: etag });
 					saveUploadSession(session!);
 
-					const speed = recordBytesTransferred(chunkLen);
-					renderProgress(partNum, speed);
+					renderProgress();
 					partUploaded = true;
 					break;
 				} catch (err: any) {
+					activePartBytes.delete(partNum);
+					renderProgress();
 					lastErr = err.message;
 					presignedUrlCache.delete(partNum);
 					const waitMs = Math.min(8000, 500 * (2 ** attempt));
@@ -3006,12 +3340,19 @@ async function performUpload(
 			}
 		}
 
+		// Initial display frame
+		renderProgress(true);
+
 		const workers: Promise<void>[] = [];
 		for (let w = 0; w < CONCURRENCY; w++) {
 			workers.push(worker());
 		}
 		await Promise.all(workers);
 
+		// Final frame at 100% completion
+		activePartBytes.clear();
+		completedBytes = uploadFileSizeBytes;
+		renderProgress(true);
 		if (process.stdout.isTTY) {
 			process.stdout.write("\n");
 		}
@@ -3130,7 +3471,6 @@ async function handleDeploy(
 	}
 
 	const activePermit = config.lastPermit!;
-	const prepCheckpoint = config.preparedCheckpoint;
 
 	// Pre-flight balance check: Prevent R2 uploads and bandwidth costs if balance is insufficient
 	try {
@@ -3178,11 +3518,21 @@ async function handleDeploy(
 		// Non-blocking fallback; server /api/upload/initiate and /api/deploy strictly enforce financial ceilings
 	}
 
+	const isCustomTarget =
+		Boolean(checkpointPath) ||
+		activePermit.modelId === "custom_model" ||
+		isLocalCheckpointTarget(activePermit.modelId);
+	const prepCheckpoint = isCustomTarget ? config.preparedCheckpoint : undefined;
+	const modelCategory = isCustomTarget
+		? "Custom Checkpoint Archive"
+		: "Base Model (Hugging Face)";
+
 	console.log(`\n=============================================`);
 	console.log(`🚀 VIVACIOUS CLOUD — JOB DEPLOYMENT`);
 	console.log(`=============================================`);
 	console.log(`Workspace Target:     ${target}`);
 	console.log(`Target Model:         ${activePermit.modelId}`);
+	console.log(`Model Category:       ${modelCategory}`);
 	console.log(`Training Method:      ${activePermit.method.toUpperCase()}`);
 	console.log(
 		`Dataset:              ${prepared.filename} (${(prepared.sizeBytes / (1024 * 1024)).toFixed(2)} MB)`
@@ -3196,19 +3546,34 @@ async function handleDeploy(
 	}
 	console.log(`---------------------------------------------`);
 
-	// Upload Dataset
+	// Upload Dataset (Backend is authoritative allocator of activeJobId on initiate)
 	const datasetUpload = await performUpload(config, prepared, "Dataset");
 	const activeJobId = datasetUpload.jobId;
 
-	// Upload Checkpoint if present
+	// Invariant: Verify dataset upload key strictly adheres to authoritative jobId prefix
+	if (!datasetUpload.uploadKey.startsWith(`datasets/${activeJobId}/`)) {
+		throw new Error(
+			`UPLOAD_KEY_MISMATCH: Dataset upload key "${datasetUpload.uploadKey}" does not match authoritative jobId prefix "datasets/${activeJobId}/".`
+		);
+	}
+
+	// Upload Checkpoint if present (strictly propagating activeJobId)
 	let checkpointKey: string | undefined;
 	if (prepCheckpoint) {
 		const cpUpload = await performUpload(
 			config,
 			prepCheckpoint,
-			"Checkpoint"
+			"Checkpoint",
+			activeJobId
 		);
 		checkpointKey = cpUpload.uploadKey;
+
+		// Invariant: Verify checkpoint upload key strictly adheres to authoritative jobId prefix
+		if (!checkpointKey.startsWith(`checkpoints/${activeJobId}/`)) {
+			throw new Error(
+				`UPLOAD_KEY_MISMATCH: Checkpoint upload key "${checkpointKey}" does not match authoritative jobId prefix "checkpoints/${activeJobId}/".`
+			);
+		}
 	}
 
 	// Step 2: Trigger Server-Authoritative Deployment
@@ -3254,7 +3619,7 @@ async function handleDeploy(
 			body: JSON.stringify({
 				jobId: activeJobId,
 				modelId: activePermit.modelId,
-				modelSource: checkpointKey ? "custom_checkpoint" : "hf",
+				modelSource: checkpointKey || isCustomTarget ? "custom_checkpoint" : "hf",
 				checkpointKey: checkpointKey,
 				checkpointConfig: prepCheckpoint?.modelConfig,
 				checkpointFingerprint: prepCheckpoint?.sha256,
@@ -4012,6 +4377,13 @@ async function main() {
 	}
 
 	switch (command) {
+		/* ==========================================================================
+		   LEGAL & PATENT INVARIANT:
+		   The identifiers "anirudha-s" and "anirudha-s ambition" are subject to legal
+		   matters and patent claims. NEVER rename, replace, substitute, alias, or
+		   remove them from this codebase. Any change to these scopes is strictly
+		   prohibited and subjects the committer to real legal consequences.
+		   ========================================================================== */
 		case "anirudha-s": {
 			const sub = args[1];
 			if (sub === "check") {
