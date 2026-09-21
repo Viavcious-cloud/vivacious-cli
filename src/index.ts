@@ -9,11 +9,17 @@
 
 import * as child_process from "node:child_process";
 import * as crypto from "node:crypto";
+import * as dns from "node:dns";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import * as zlib from "node:zlib";
+
+// Force IPv4-first DNS resolution to avoid intermittent IPv6 packet drops, MTU blackholes, and route flapping
+try {
+	dns.setDefaultResultOrder("ipv4first");
+} catch {}
 
 const API_HOST =
 	process.env.VIVACIOUS_API_HOST ||
@@ -21,6 +27,37 @@ const API_HOST =
 	"https://vivacious-orchestrator.vivacious-cloud.workers.dev";
 const CONFIG_DIR = path.join(os.homedir(), ".vivacious");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+
+export function extractErrorCause(err: any): string {
+	if (!err) return "Unknown error";
+	const cause = (err as any)?.cause;
+	const causeDetails =
+		cause?.message ||
+		cause?.code ||
+		(cause ? String(cause) : "");
+	return causeDetails
+		? `${err.message || String(err)} (${causeDetails})`
+		: err.message || String(err);
+}
+
+export async function fetchWithRetry(
+	url: string,
+	options: any,
+	maxRetries: number = 3
+): Promise<Response> {
+	let lastErr: any;
+	for (let attempt = 1; attempt <= maxRetries; attempt++) {
+		try {
+			return await fetch(url, options);
+		} catch (err: any) {
+			lastErr = err;
+			if (attempt < maxRetries) {
+				await new Promise((r) => setTimeout(r, 1000 * attempt));
+			}
+		}
+	}
+	throw lastErr;
+}
 
 function openBrowser(url: string): void {
 	try {
@@ -2457,13 +2494,14 @@ async function handlePermit(
 	);
 
 	try {
-		const response = await fetch(`${API_HOST}/api/permit`, {
+		const response = await fetchWithRetry(`${API_HOST}/api/permit`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${accessToken}`,
 			},
 			body: JSON.stringify(payload),
+			signal: AbortSignal.timeout(30_000),
 		});
 
 		if (response.status === 401) {
@@ -2606,7 +2644,7 @@ async function handlePermit(
 		return true;
 	} catch (err: any) {
 		console.error(
-			`\n[Error] Failed to connect to orchestrator: ${err.message}`
+			`\n[Error] Failed to connect to orchestrator: ${extractErrorCause(err)}`
 		);
 		process.exitCode = 1;
 		return false;
@@ -2971,7 +3009,7 @@ async function performUpload(
 			session &&
 			session.filePath === uploadFilePath &&
 			session.fileSizeBytes === uploadFileSizeBytes &&
-			session.mtimeMs === fileStat.mtimeMs &&
+			Math.abs(session.mtimeMs - fileStat.mtimeMs) < 10000 &&
 			Boolean(session.uploadId) &&
 			Boolean(session.uploadKey);
 
@@ -3060,13 +3098,19 @@ async function performUpload(
 			}
 		}
 
+		const rawConcurrency = Number(process.env.VIVACIOUS_UPLOAD_CONCURRENCY) || 2;
+		const CONCURRENCY = Math.min(
+			Math.max(1, rawConcurrency),
+			Math.max(1, pendingPartNumbers.length)
+		);
+
 		if (completedMap.size > 0) {
 			console.log(
 				`[Transfer Engine] Instant resume active: ${completedMap.size}/${totalParts} parts previously uploaded. Skipping redundant hash scan.`
 			);
 		}
 		console.log(
-			`Uploading ${fileLabel} across ${totalParts} adaptive chunk(s) (${(chunkSize / (1024 * 1024)).toFixed(0)} MB/part, concurrency: 4)...`
+			`Uploading ${fileLabel} across ${totalParts} adaptive chunk(s) (${(chunkSize / (1024 * 1024)).toFixed(0)} MB/part, concurrency: ${CONCURRENCY})...`
 		);
 
 		// Prefetching cache for presigned part URLs
@@ -3076,7 +3120,7 @@ async function performUpload(
 			if (existing) return existing;
 
 			const promise = (async () => {
-				for (let attempt = 1; attempt <= 3; attempt++) {
+				for (let attempt = 1; attempt <= 5; attempt++) {
 					try {
 						const partRes = await fetch(`${API_HOST}/api/upload/part`, {
 							method: "POST",
@@ -3091,18 +3135,33 @@ async function performUpload(
 								partNumber: partNum,
 								uploadToken,
 							}),
+							signal: AbortSignal.timeout(30_000),
 						});
 
 						if (!partRes.ok) {
 							const errBody = await partRes.text().catch(() => "");
-							throw new Error(`Signed URL request failed (HTTP ${partRes.status}): ${errBody}`);
+							throw new Error(
+								`Signed URL request failed (HTTP ${partRes.status}): ${errBody}`
+							);
 						}
 
 						const partData = (await partRes.json()) as any;
 						return partData.url as string;
 					} catch (err: any) {
-						if (attempt === 3) throw err;
-						await new Promise((r) => setTimeout(r, 500 * attempt));
+						if (attempt === 5) {
+							const cause = (err as any)?.cause;
+							const causeDetails =
+								cause?.message ||
+								cause?.code ||
+								(cause ? String(cause) : "");
+							const fullMsg = causeDetails
+								? `${err.message} (${causeDetails})`
+								: err.message || String(err);
+							throw new Error(
+								`Failed to obtain presigned URL for part ${partNum}: ${fullMsg}`
+							);
+						}
+						await new Promise((r) => setTimeout(r, 1000 * attempt));
 					}
 				}
 				throw new Error(`Failed to obtain presigned URL for part ${partNum}`);
@@ -3112,7 +3171,7 @@ async function performUpload(
 			return promise;
 		}
 
-		// Real-time streaming upload telemetry & smooth progress reporting
+		// Real-time streaming upload telemetry & strictly monotonic progress reporting
 		let completedBytes = 0;
 		for (let p = 1; p <= totalParts; p++) {
 			if (completedMap.has(p)) {
@@ -3123,7 +3182,6 @@ async function performUpload(
 		}
 		const initialCompletedBytes = completedBytes;
 
-		const activePartBytes = new Map<number, number>();
 		const startTime = Date.now();
 		const speedSamples: { time: number; bytes: number }[] = [];
 		let smoothedSpeedMBs = 0;
@@ -3154,14 +3212,12 @@ async function performUpload(
 						: smoothedSpeedMBs * 0.75 + rawSpeed * 0.25;
 			} else {
 				const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
-				const inFlight = Array.from(activePartBytes.values()).reduce(
-					(a, b) => a + b,
-					0
-				);
 				const transferredSinceStart =
-					completedBytes - initialCompletedBytes + inFlight;
-				smoothedSpeedMBs =
-					transferredSinceStart / (1024 * 1024) / elapsedSec;
+					completedBytes - initialCompletedBytes;
+				if (transferredSinceStart > 0) {
+					smoothedSpeedMBs =
+						transferredSinceStart / (1024 * 1024) / elapsedSec;
+				}
 			}
 
 			if (smoothedSpeedMBs > peakSpeedMBs) {
@@ -3171,13 +3227,9 @@ async function performUpload(
 
 		function renderProgress(force = false) {
 			const now = Date.now();
-			const inFlight = Array.from(activePartBytes.values()).reduce(
-				(a, b) => a + b,
-				0
-			);
 			const currentTotalBytes = Math.min(
 				uploadFileSizeBytes,
-				completedBytes + inFlight
+				completedBytes
 			);
 			const pctNum = Math.min(
 				100,
@@ -3255,7 +3307,7 @@ async function performUpload(
 			let partUploaded = false;
 			let lastErr = "";
 
-			for (let attempt = 1; attempt <= 5; attempt++) {
+			for (let attempt = 1; attempt <= 8; attempt++) {
 				try {
 					const url = await getPresignedUrl(partNum);
 
@@ -3268,7 +3320,6 @@ async function performUpload(
 						await fileHandle.close();
 					}
 
-					activePartBytes.set(partNum, chunkLen);
 					renderProgress();
 
 					const putRes = await fetch(url, {
@@ -3277,6 +3328,7 @@ async function performUpload(
 							"Content-Length": String(chunkLen),
 						},
 						body: buffer,
+						signal: AbortSignal.timeout(300_000),
 					});
 
 					if (!putRes.ok) {
@@ -3287,7 +3339,6 @@ async function performUpload(
 					const rawEtag = putRes.headers.get("ETag") || `etag-${partNum}`;
 					const etag = rawEtag.replace(/"/g, "");
 					completedMap.set(partNum, etag);
-					activePartBytes.delete(partNum);
 					completedBytes += chunkLen;
 					onChunkBytes(chunkLen);
 					session!.completedParts.push({ PartNumber: partNum, ETag: etag });
@@ -3297,24 +3348,32 @@ async function performUpload(
 					partUploaded = true;
 					break;
 				} catch (err: any) {
-					activePartBytes.delete(partNum);
-					renderProgress(true);
-					lastErr = err.message;
 					presignedUrlCache.delete(partNum);
-					const waitMs = Math.min(8000, 500 * (2 ** attempt));
+					const cause = (err as any)?.cause;
+					const causeDetails =
+						cause?.message ||
+						cause?.code ||
+						(cause ? String(cause) : "");
+					lastErr = causeDetails
+						? `${err.message} (${causeDetails})`
+						: err.message || String(err);
+					renderProgress(true);
+					const waitMs = Math.min(
+						20000,
+						1000 * Math.pow(1.5, attempt) + Math.random() * 1000
+					);
 					await new Promise((r) => setTimeout(r, waitMs));
 				}
 			}
 
 			if (!partUploaded) {
 				throw new Error(
-					`Part ${partNum} permanently failed after 5 retry attempts: ${lastErr}`
+					`Part ${partNum} permanently failed after 8 retry attempts: ${lastErr}`
 				);
 			}
 		}
 
-		// Concurrency worker pool with pipelined URL prefetching
-		const CONCURRENCY = Math.min(4, Math.max(1, pendingPartNumbers.length));
+		// Concurrency worker pool: controlled concurrency balances upload speed without saturating TCP windows
 		let partQueueIndex = 0;
 
 		async function worker(): Promise<void> {
@@ -3322,12 +3381,10 @@ async function performUpload(
 				const idx = partQueueIndex++;
 				const partNum = pendingPartNumbers[idx]!;
 
-				// Pipeline: prefetch next URLs ahead of workers
-				for (let ahead = 1; ahead <= 4; ahead++) {
-					const nextIdx = idx + ahead;
-					if (nextIdx < pendingPartNumbers.length) {
-						void getPresignedUrl(pendingPartNumbers[nextIdx]!);
-					}
+				// Pipeline: prefetch next URL ahead of worker (1 ahead max to avoid API hammering)
+				const nextIdx = idx + 1;
+				if (nextIdx < pendingPartNumbers.length) {
+					void getPresignedUrl(pendingPartNumbers[nextIdx]!);
 				}
 
 				await uploadSinglePart(partNum);
@@ -3348,7 +3405,6 @@ async function performUpload(
 		clearInterval(progressTicker);
 
 		// Final frame at 100% completion
-		activePartBytes.clear();
 		completedBytes = uploadFileSizeBytes;
 		renderProgress(true);
 		if (process.stdout.isTTY) {
