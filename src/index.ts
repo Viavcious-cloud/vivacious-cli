@@ -13,7 +13,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { Transform } from "node:stream";
 import * as zlib from "node:zlib";
 
 const API_HOST =
@@ -3240,7 +3239,9 @@ async function performUpload(
 			const statusLine = `[Transfer] [${bar}] ${pctStr.padStart(5, " ")}% | ${curMB} / ${totalMB} MB | Speed: ${smoothedSpeedMBs.toFixed(1)} MB/s (Peak: ${peakSpeedMBs.toFixed(1)} MB/s) | Parts: ${completedCount}/${totalParts} | ETA: ${etaStr}`;
 
 			if (process.stdout.isTTY) {
-				process.stdout.write(`\r\x1b[K${statusLine}`);
+				const cols = process.stdout.columns || 80;
+				const display = statusLine.length > cols - 1 ? statusLine.slice(0, cols - 1) : statusLine;
+				process.stdout.write(`\r\x1b[K${display}`);
 			} else {
 				console.log(statusLine);
 			}
@@ -3257,33 +3258,25 @@ async function performUpload(
 			for (let attempt = 1; attempt <= 5; attempt++) {
 				try {
 					const url = await getPresignedUrl(partNum);
-					const partStream = fs.createReadStream(uploadFilePath, {
-						start,
-						end: end - 1,
-						highWaterMark: 256 * 1024,
-					});
 
-					let partTransferred = 0;
-					const progressStream = new Transform({
-						transform(chunk: Buffer, _encoding, callback) {
-							partTransferred += chunk.length;
-							activePartBytes.set(partNum, partTransferred);
-							onChunkBytes(chunk.length);
-							renderProgress();
-							callback(null, chunk);
-						},
-					});
+					// Read chunk cleanly into a Buffer to eliminate Node stream pipe deadlocks
+					const buffer = Buffer.allocUnsafe(chunkLen);
+					const fileHandle = await fs.promises.open(uploadFilePath, "r");
+					try {
+						await fileHandle.read(buffer, 0, chunkLen, start);
+					} finally {
+						await fileHandle.close();
+					}
 
-					const bodyStream = partStream.pipe(progressStream);
+					activePartBytes.set(partNum, chunkLen);
+					renderProgress();
 
 					const putRes = await fetch(url, {
 						method: "PUT",
 						headers: {
 							"Content-Length": String(chunkLen),
 						},
-						body: bodyStream as any,
-						// @ts-ignore
-						duplex: "half",
+						body: buffer,
 					});
 
 					if (!putRes.ok) {
@@ -3296,15 +3289,16 @@ async function performUpload(
 					completedMap.set(partNum, etag);
 					activePartBytes.delete(partNum);
 					completedBytes += chunkLen;
+					onChunkBytes(chunkLen);
 					session!.completedParts.push({ PartNumber: partNum, ETag: etag });
 					saveUploadSession(session!);
 
-					renderProgress();
+					renderProgress(true);
 					partUploaded = true;
 					break;
 				} catch (err: any) {
 					activePartBytes.delete(partNum);
-					renderProgress();
+					renderProgress(true);
 					lastErr = err.message;
 					presignedUrlCache.delete(partNum);
 					const waitMs = Math.min(8000, 500 * (2 ** attempt));
@@ -3340,14 +3334,18 @@ async function performUpload(
 			}
 		}
 
-		// Initial display frame
+		// Initial display frame & active render ticker
 		renderProgress(true);
+		const progressTicker = setInterval(() => {
+			renderProgress();
+		}, 250);
 
 		const workers: Promise<void>[] = [];
 		for (let w = 0; w < CONCURRENCY; w++) {
 			workers.push(worker());
 		}
 		await Promise.all(workers);
+		clearInterval(progressTicker);
 
 		// Final frame at 100% completion
 		activePartBytes.clear();
