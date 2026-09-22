@@ -21,10 +21,40 @@ try {
 	dns.setDefaultResultOrder("ipv4first");
 } catch {}
 
-const API_HOST =
-	process.env.VIVACIOUS_API_HOST ||
-	process.env.VIVACIOUS_API_URL ||
-	"https://vivacious-orchestrator.vivacious-cloud.workers.dev";
+const isDebugMode =
+	process.argv.includes("--debug") ||
+	process.env.DEBUG === "1" ||
+	process.env.VIVACIOUS_DEBUG === "1";
+
+function handleProcessFatalError(prefix: string, err: any): void {
+	if (process.stdout.isTTY) {
+		process.stderr.write("\n");
+	}
+	const msg = err instanceof Error ? err.message : String(err);
+	console.error(`\n[${prefix}] ${msg}`);
+	if (isDebugMode && err?.stack) {
+		console.error(err.stack);
+	}
+	process.exitCode = 1;
+}
+
+process.on("uncaughtException", (err) => {
+	handleProcessFatalError("Fatal CLI Error", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+	handleProcessFatalError("Fatal CLI Error", reason);
+});
+
+export function getApiHost(): string {
+	return (
+		process.env.VIVACIOUS_API_HOST ||
+		process.env.VIVACIOUS_API_URL ||
+		"https://vivacious-orchestrator.vivacious-cloud.workers.dev"
+	);
+}
+
+const API_HOST = getApiHost();
 const CONFIG_DIR = path.join(os.homedir(), ".vivacious");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 
@@ -151,6 +181,13 @@ export interface Config {
 	resumeContext?: ResumeContext | undefined;
 }
 
+export class AuthenticationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AuthenticationError";
+	}
+}
+
 /**
  * Safely parses the expiration timestamp (in milliseconds) from a JWT without external libraries.
  */
@@ -159,14 +196,9 @@ export function parseJwtExpiryMs(token: string): number | null {
 		const parts = token.split(".");
 		if (parts.length !== 3) return null;
 		const base64Url = parts[1];
+		if (!base64Url) return null;
 		const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
-		const jsonPayload = decodeURIComponent(
-			Buffer.from(base64, "base64")
-				.toString("binary")
-				.split("")
-				.map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-				.join("")
-		);
+		const jsonPayload = Buffer.from(base64, "base64").toString("utf-8");
 		const decoded = JSON.parse(jsonPayload);
 		return typeof decoded.exp === "number" && Number.isFinite(decoded.exp)
 			? decoded.exp * 1000
@@ -201,65 +233,97 @@ export function formatApiError(err: any): string {
 	return JSON.stringify(err);
 }
 
+let inFlightRefreshPromise: Promise<string> | null = null;
+let lastRefreshTimestamp = 0;
+
 export async function getValidAccessToken(
 	forceRefresh: boolean = false
 ): Promise<string> {
-	const config = loadConfig();
+	let config = loadConfig();
 	if (!config.accessToken) {
 		console.error(
 			'[Error] You are not logged in. Please run "vivacious login anirudha-s" first.'
 		);
 		process.exitCode = 1;
-		return "";
+		throw new AuthenticationError(
+			'You are not logged in. Please run "vivacious login anirudha-s" first.'
+		);
 	}
 
 	const now = Date.now();
-	const tokenExp =
+	let tokenExp =
 		parseJwtExpiryMs(config.accessToken) || config.tokenExpiresAt || 0;
-	// Trigger proactive refresh if token expires within 120 seconds (or is already expired)
-	const isExpiringSoon = tokenExp - now < 120_000;
+
+	// If another worker completed a refresh recently (< 5s ago) and token is currently valid, reuse it
+	if (forceRefresh && now - lastRefreshTimestamp < 5000 && tokenExp > now + 300_000) {
+		return config.accessToken;
+	}
+
+	// Trigger proactive refresh if token expires within 600 seconds (10 minutes)
+	const isExpiringSoon = tokenExp - now < 600_000;
 
 	if ((isExpiringSoon || forceRefresh) && config.refreshToken) {
-		try {
-			const refreshRes = await fetch(`${API_HOST}/api/auth/token/refresh`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ refreshToken: config.refreshToken }),
-			});
+		if (inFlightRefreshPromise) {
+			return inFlightRefreshPromise;
+		}
 
-			if (refreshRes.ok) {
-				const refreshData: any = await refreshRes.json();
-				if (refreshData.access_token) {
-					config.accessToken = refreshData.access_token;
-					if (refreshData.refresh_token) {
-						config.refreshToken = refreshData.refresh_token;
+		inFlightRefreshPromise = (async () => {
+			try {
+				const refreshRes = await fetch(`${getApiHost()}/api/auth/token/refresh`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ refreshToken: config.refreshToken }),
+				});
+
+				if (refreshRes.ok) {
+					const refreshData: any = await refreshRes.json();
+					if (refreshData.access_token) {
+						config.accessToken = refreshData.access_token;
+						if (refreshData.refresh_token) {
+							config.refreshToken = refreshData.refresh_token;
+						}
+						const parsedExp = parseJwtExpiryMs(refreshData.access_token);
+						config.tokenExpiresAt =
+							parsedExp || Date.now() + (refreshData.expires_in || 3600) * 1000;
+						saveConfig(config);
+						lastRefreshTimestamp = Date.now();
+						return config.accessToken!;
 					}
-					const parsedExp = parseJwtExpiryMs(refreshData.access_token);
-					config.tokenExpiresAt =
-						parsedExp || Date.now() + (refreshData.expires_in || 3600) * 1000;
-					saveConfig(config);
-					return config.accessToken!;
+				} else {
+					if (refreshRes.status === 401 || refreshRes.status === 400) {
+						console.warn(
+							'[Notice] Session expired. Please re-authenticate via "vivacious login anirudha-s".'
+						);
+					}
 				}
-			} else {
-				if (refreshRes.status === 401 || refreshRes.status === 400) {
-					console.warn(
-						'[Notice] Session expired. Please re-authenticate via "vivacious login anirudha-s".'
-					);
-				}
+			} catch (refreshErr: any) {
+				console.warn(
+					`[Notice] Temporary network issue during session refresh: ${refreshErr.message || "Continuing with current credentials..."}`
+				);
+			} finally {
+				inFlightRefreshPromise = null;
 			}
-		} catch (refreshErr: any) {
-			console.warn(
-				`[Notice] Temporary network issue during session refresh: ${refreshErr.message || "Continuing with current credentials..."}`
-			);
+			config = loadConfig();
+			return config.accessToken || "";
+		})();
+
+		const refreshedToken = await inFlightRefreshPromise;
+		if (refreshedToken) {
+			tokenExp = parseJwtExpiryMs(refreshedToken) || 0;
+			if (tokenExp > Date.now()) {
+				return refreshedToken;
+			}
 		}
 	}
 
 	// If token is already expired and cannot be refreshed, halt cleanly with guidance
-	if (tokenExp > 0 && tokenExp <= now) {
+	if (tokenExp > 0 && tokenExp <= Date.now()) {
 		console.error("\n[Notice] Your authentication session has expired.");
 		console.error('Please run "vivacious login anirudha-s" to authenticate.\n');
 		process.exitCode = 1;
-		return "";
+		throw new AuthenticationError(
+			'Your authentication session has expired. Please run "vivacious login anirudha-s" to authenticate.'
+		);
 	}
 
 	return config.accessToken || "";
@@ -2958,7 +3022,8 @@ async function performUpload(
 	fileLabel: string,
 	jobId?: string
 ): Promise<{ uploadKey: string; jobId: string }> {
-	const accessToken = await getValidAccessToken();
+	let currentAccessToken = await getValidAccessToken();
+	const uploadAbortController = new AbortController();
 	console.log(
 		`Initiating high-speed parallel multipart transfer for ${fileLabel} to Cloudflare R2...`
 	);
@@ -3036,9 +3101,10 @@ async function performUpload(
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					Authorization: `Bearer ${accessToken}`,
+					Authorization: `Bearer ${currentAccessToken}`,
 				},
 				body: JSON.stringify(bodyPayload),
+				signal: uploadAbortController.signal,
 			});
 
 			if (!initRes.ok) {
@@ -3122,11 +3188,14 @@ async function performUpload(
 			const promise = (async () => {
 				for (let attempt = 1; attempt <= 5; attempt++) {
 					try {
+						if (uploadAbortController.signal.aborted) {
+							throw new Error("Upload aborted due to fatal error");
+						}
 						const partRes = await fetch(`${API_HOST}/api/upload/part`, {
 							method: "POST",
 							headers: {
 								"Content-Type": "application/json",
-								Authorization: `Bearer ${accessToken}`,
+								Authorization: `Bearer ${currentAccessToken}`,
 								...(uploadToken ? { "x-upload-token": uploadToken } : {}),
 							},
 							body: JSON.stringify({
@@ -3140,6 +3209,17 @@ async function performUpload(
 
 						if (!partRes.ok) {
 							const errBody = await partRes.text().catch(() => "");
+							if (partRes.status === 401) {
+								try {
+									const freshToken = await getValidAccessToken(true);
+									if (freshToken) {
+										currentAccessToken = freshToken;
+									}
+								} catch (authErr) {
+									uploadAbortController.abort();
+									throw authErr;
+								}
+							}
 							throw new Error(
 								`Signed URL request failed (HTTP ${partRes.status}): ${errBody}`
 							);
@@ -3148,6 +3228,9 @@ async function performUpload(
 						const partData = (await partRes.json()) as any;
 						return partData.url as string;
 					} catch (err: any) {
+						if (uploadAbortController.signal.aborted) {
+							throw err;
+						}
 						if (attempt === 5) {
 							const cause = (err as any)?.cause;
 							const causeDetails =
@@ -3378,13 +3461,18 @@ async function performUpload(
 
 		async function worker(): Promise<void> {
 			while (partQueueIndex < pendingPartNumbers.length) {
+				if (uploadAbortController.signal.aborted) {
+					return;
+				}
 				const idx = partQueueIndex++;
 				const partNum = pendingPartNumbers[idx]!;
 
 				// Pipeline: prefetch next URL ahead of worker (1 ahead max to avoid API hammering)
 				const nextIdx = idx + 1;
 				if (nextIdx < pendingPartNumbers.length) {
-					void getPresignedUrl(pendingPartNumbers[nextIdx]!);
+					void getPresignedUrl(pendingPartNumbers[nextIdx]!).catch(() => {
+						// Absorbed here to prevent floating unhandled rejection; worker will catch and retry when awaiting
+					});
 				}
 
 				await uploadSinglePart(partNum);
@@ -3397,12 +3485,15 @@ async function performUpload(
 			renderProgress();
 		}, 250);
 
-		const workers: Promise<void>[] = [];
-		for (let w = 0; w < CONCURRENCY; w++) {
-			workers.push(worker());
+		try {
+			const workers: Promise<void>[] = [];
+			for (let w = 0; w < CONCURRENCY; w++) {
+				workers.push(worker());
+			}
+			await Promise.all(workers);
+		} finally {
+			clearInterval(progressTicker);
 		}
-		await Promise.all(workers);
-		clearInterval(progressTicker);
 
 		// Final frame at 100% completion
 		completedBytes = uploadFileSizeBytes;
@@ -3416,15 +3507,31 @@ async function performUpload(
 			.map(([PartNumber, ETag]) => ({ PartNumber, ETag }))
 			.sort((a, b) => a.PartNumber - b.PartNumber);
 
-		const completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
+		const completeToken = (await getValidAccessToken()) || currentAccessToken;
+		let completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
-				Authorization: `Bearer ${accessToken}`,
+				Authorization: `Bearer ${completeToken}`,
 				...(uploadToken ? { "x-upload-token": uploadToken } : {}),
 			},
 			body: JSON.stringify({ uploadId, key: uploadKey, parts, uploadToken }),
+			signal: uploadAbortController.signal,
 		});
+
+		if (completeRes.status === 401) {
+			const refreshedToken = await getValidAccessToken(true);
+			completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${refreshedToken}`,
+					...(uploadToken ? { "x-upload-token": uploadToken } : {}),
+				},
+				body: JSON.stringify({ uploadId, key: uploadKey, parts, uploadToken }),
+				signal: uploadAbortController.signal,
+			});
+		}
 
 		if (!completeRes.ok) {
 			const errData = await completeRes.json().catch(() => ({}));
@@ -3441,6 +3548,9 @@ async function performUpload(
 		);
 		return { uploadKey, jobId: finalJobId };
 	} catch (uploadErr: any) {
+		if (process.stdout.isTTY) {
+			process.stdout.write("\n");
+		}
 		console.error(`\n[Upload Failed] ${uploadErr.message}`);
 		console.warn(
 			`[Upload Session Preserved] Progress saved to session cache. Re-running will resume from last completed part without re-reading.`
@@ -4690,8 +4800,11 @@ async function main() {
 
 if (require.main === module) {
 	void main().catch((err: unknown) => {
+		if (process.stdout.isTTY) {
+			process.stderr.write("\n");
+		}
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		console.error(`Fatal CLI Error: ${errorMsg}`);
-		process.exit(1);
+		process.exitCode = 1;
 	});
 }
