@@ -3,7 +3,7 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseJwtExpiryMs, getValidAccessToken } from "../src/index";
+import { parseJwtExpiryMs, getValidAccessToken, getUploadSessionId } from "../src/index";
 
 async function runConcurrencyTests(): Promise<void> {
 	console.log("=================================================");
@@ -183,6 +183,23 @@ async function runConcurrencyTests(): Promise<void> {
 		} finally {
 			process.removeListener("unhandledRejection", handler);
 		}
+	});
+
+	// -------------------------------------------------------------
+	// 4. Stale Cross-Job Resume Session Isolation
+	// -------------------------------------------------------------
+	console.log("\n--- 4. Cross-Job Resume Session Isolation ---");
+
+	await test("getUploadSessionId isolates sessions per jobId", () => {
+		const filePath = "/path/to/checkpoint.tar.gz";
+		const size = 500_000_000;
+		const mtime = 12345678;
+		const s1 = getUploadSessionId(filePath, size, mtime, "job-aaa");
+		const s2 = getUploadSessionId(filePath, size, mtime, "job-bbb");
+		const sDefault = getUploadSessionId(filePath, size, mtime);
+
+		assert.notStrictEqual(s1, s2, "Sessions for different jobs must have different session IDs!");
+		assert.notStrictEqual(s1, sDefault, "Job-scoped session ID must differ from unscoped default!");
 	});
 
 	// -------------------------------------------------------------

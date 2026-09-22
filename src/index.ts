@@ -378,11 +378,13 @@ const UPLOAD_SESSIONS_DIR = path.join(CONFIG_DIR, "uploads");
 export function getUploadSessionId(
 	filePath: string,
 	sizeBytes: number,
-	mtimeMs: number
+	mtimeMs: number,
+	jobId?: string
 ): string {
+	const jobSuffix = jobId ? `:${jobId.trim()}` : "";
 	return crypto
 		.createHash("sha256")
-		.update(`${path.resolve(filePath)}:${sizeBytes}:${mtimeMs}`)
+		.update(`${path.resolve(filePath)}:${sizeBytes}:${mtimeMs}${jobSuffix}`)
 		.digest("hex")
 		.slice(0, 16);
 }
@@ -3066,17 +3068,51 @@ async function performUpload(
 		const sessionId = getUploadSessionId(
 			uploadFilePath,
 			uploadFileSizeBytes,
-			fileStat.mtimeMs
+			fileStat.mtimeMs,
+			finalJobId.trim() || undefined
 		);
 		let session = loadUploadSession(sessionId);
 
+		// Also check if an un-scoped session existed for this file
+		if (!session && finalJobId.trim()) {
+			const genericSessionId = getUploadSessionId(
+				uploadFilePath,
+				uploadFileSizeBytes,
+				fileStat.mtimeMs
+			);
+			const genericSession = loadUploadSession(genericSessionId);
+			if (genericSession) {
+				const isMatchingKey =
+					Boolean(genericSession.uploadKey) &&
+					(genericSession.uploadKey.startsWith(`checkpoints/${finalJobId.trim()}/`) ||
+					 genericSession.uploadKey.startsWith(`datasets/${finalJobId.trim()}/`));
+				if (isMatchingKey) {
+					session = genericSession;
+				} else {
+					deleteUploadSession(genericSessionId);
+				}
+			}
+		}
+
+		const keyMatchesJob =
+			!finalJobId.trim() ||
+			(Boolean(session?.uploadKey) &&
+				(session!.uploadKey.startsWith(`checkpoints/${finalJobId.trim()}/`) ||
+				 session!.uploadKey.startsWith(`datasets/${finalJobId.trim()}/`)));
+
 		const canResume =
-			session &&
-			session.filePath === uploadFilePath &&
-			session.fileSizeBytes === uploadFileSizeBytes &&
-			Math.abs(session.mtimeMs - fileStat.mtimeMs) < 10000 &&
-			Boolean(session.uploadId) &&
-			Boolean(session.uploadKey);
+			Boolean(session) &&
+			session!.filePath === uploadFilePath &&
+			session!.fileSizeBytes === uploadFileSizeBytes &&
+			Math.abs(session!.mtimeMs - fileStat.mtimeMs) < 10000 &&
+			Boolean(session!.uploadId) &&
+			Boolean(session!.uploadKey) &&
+			keyMatchesJob;
+
+		if (session && !canResume) {
+			deleteUploadSession(session.sessionId);
+			session = null;
+		}
 
 		if (canResume && session) {
 			uploadId = session.uploadId;
@@ -3097,7 +3133,7 @@ async function performUpload(
 				bodyPayload.jobId = finalJobId.trim();
 			}
 
-			const initRes = await fetch(`${API_HOST}/api/upload/initiate`, {
+			const initRes = await fetch(`${getApiHost()}/api/upload/initiate`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
@@ -3191,7 +3227,7 @@ async function performUpload(
 						if (uploadAbortController.signal.aborted) {
 							throw new Error("Upload aborted due to fatal error");
 						}
-						const partRes = await fetch(`${API_HOST}/api/upload/part`, {
+						const partRes = await fetch(`${getApiHost()}/api/upload/part`, {
 							method: "POST",
 							headers: {
 								"Content-Type": "application/json",
@@ -3508,7 +3544,7 @@ async function performUpload(
 			.sort((a, b) => a.PartNumber - b.PartNumber);
 
 		const completeToken = (await getValidAccessToken()) || currentAccessToken;
-		let completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
+		let completeRes = await fetch(`${getApiHost()}/api/upload/complete`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -3521,7 +3557,7 @@ async function performUpload(
 
 		if (completeRes.status === 401) {
 			const refreshedToken = await getValidAccessToken(true);
-			completeRes = await fetch(`${API_HOST}/api/upload/complete`, {
+			completeRes = await fetch(`${getApiHost()}/api/upload/complete`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
