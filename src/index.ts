@@ -591,10 +591,13 @@ export async function calculateDirectoryFingerprint(
  */
 export function calculateAdaptiveChunkSize(totalBytes: number): number {
 	const MIN_CHUNK_SIZE = 16 * 1024 * 1024; // 16 MiB min
-	const MAX_CHUNK_SIZE = 256 * 1024 * 1024; // 256 MiB max
+	const MAX_CHUNK_SIZE = 5 * 1024 * 1024 * 1024; // 5 GiB S3/R2 max part size
 	const TARGET_PARTS = 400;
+	const MAX_SAFE_PARTS = 8000; // Cloudflare R2 / AWS S3 hard limit is 10,000 parts
 
-	const rawChunk = Math.ceil(totalBytes / TARGET_PARTS);
+	// Ensure chunk size scales up so total parts never exceed MAX_SAFE_PARTS
+	const minChunkForPartLimit = Math.ceil(totalBytes / MAX_SAFE_PARTS);
+	const rawChunk = Math.max(Math.ceil(totalBytes / TARGET_PARTS), minChunkForPartLimit);
 	const alignedChunk =
 		Math.ceil(rawChunk / (16 * 1024 * 1024)) * (16 * 1024 * 1024);
 
