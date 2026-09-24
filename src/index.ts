@@ -3999,6 +3999,9 @@ async function handleStatus(jobId?: string) {
 				: rawStatus;
 
 		console.log(`Status:               ${displayStatus}`);
+		if (data.error_message) {
+			console.log(`Failure Reason:       ${data.error_message}`);
+		}
 		console.log(
 			`Progress:             ${Number(data.progress_percent || 0).toFixed(1)}%`
 		);
