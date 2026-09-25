@@ -3952,6 +3952,71 @@ async function handleBalance() {
 	}
 }
 
+function formatCustomerFailureReason(rawReason: string): string {
+	if (!rawReason || typeof rawReason !== "string") {
+		return "Training run interrupted due to upstream remote server latency. Please retry shortly.";
+	}
+	const lower = rawReason.toLowerCase();
+
+	if (
+		lower.includes("balance") ||
+		lower.includes("credit") ||
+		lower.includes("payment") ||
+		lower.includes("not_allowed") ||
+		lower.includes("hyperstack") ||
+		lower.includes("vastai") ||
+		lower.includes("runpod") ||
+		lower.includes("vultr") ||
+		lower.includes("capacity") ||
+		lower.includes("busy") ||
+		lower.includes("instances available")
+	) {
+		return "Unable to secure available GPU hardware instances right now. No instances available.";
+	}
+
+	if (
+		lower.includes("restricted") ||
+		lower.includes("gated") ||
+		lower.includes("401") ||
+		lower.includes("403")
+	) {
+		return "Access to the requested model repository is restricted. Please verify repository permissions.";
+	}
+
+	if (
+		lower.includes("dataset") &&
+		(lower.includes("download") ||
+			lower.includes("not found") ||
+			lower.includes("failed"))
+	) {
+		return "Remote connection interrupted while streaming dataset across regional nodes.";
+	}
+
+	if (
+		lower.includes("timeout") ||
+		lower.includes("heartbeat") ||
+		lower.includes("crashed") ||
+		lower.includes("silence")
+	) {
+		return "Remote GPU host connection timed out due to upstream datacenter latency.";
+	}
+
+	if (
+		lower.includes("space") ||
+		lower.includes("disk") ||
+		lower.includes("serializing") ||
+		lower.includes("os error")
+	) {
+		return "Remote host storage operation timed out during model packaging.";
+	}
+
+	if (rawReason.includes("{") || rawReason.includes("}")) {
+		return "Training run interrupted due to upstream remote server latency. Please retry shortly.";
+	}
+
+	return rawReason.trim();
+}
+
 // 6. Query Job Status & Live Telemetry
 async function handleStatus(jobId?: string) {
 	const accessToken = await getValidAccessToken();
@@ -3999,8 +4064,8 @@ async function handleStatus(jobId?: string) {
 				: rawStatus;
 
 		console.log(`Status:               ${displayStatus}`);
-		if (data.error_message) {
-			console.log(`Failure Reason:       ${data.error_message}`);
+		if (rawStatus === "FAILED" && data.error_message) {
+			console.log(`Failure Reason:       ${formatCustomerFailureReason(data.error_message)}`);
 		}
 		console.log(
 			`Progress:             ${Number(data.progress_percent || 0).toFixed(1)}%`
@@ -4085,8 +4150,6 @@ async function handleLogs(jobId?: string) {
 			});
 		} else if (typeof data.logs === "string" && data.logs.trim().length > 0) {
 			console.log(data.logs);
-		} else if (data.error_message) {
-			console.log(`  [Details] ${data.error_message}`);
 		} else {
 			console.log(
 				`  [Telemetry] GPU container running normally. Training progress: ${Number(data.progress_percent || 0).toFixed(1)}%.`
