@@ -1,0 +1,34 @@
+name: 💡 Model Support Request
+description: Request support for a specific LLM architecture or model family on Vivacious Cloud
+title: "[Model Request]: "
+labels: ["enhancement", "models"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for requesting a model! Vivacious Cloud auto-routes fine-tuning jobs across 12+ cloud providers on the cheapest alive GPU.
+  - type: input
+    id: model_id
+    attributes:
+      label: Hugging Face Model ID
+      description: What is the exact model identifier on Hugging Face?
+      placeholder: e.g. unsloth/DeepSeek-R1-Distill-Qwen-7B
+    validations:
+      required: true
+  - type: dropdown
+    id: training_method
+    attributes:
+      label: Target Training Method
+      description: What training method are you planning to run?
+      options:
+        - LoRA (Low-Rank Adaptation)
+        - 4-bit QLoRA
+        - Full-Precision Fine-Tuning
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Use Case Context
+      description: Tell us a bit about your dataset or use case.
+      placeholder: E.g., Fine-tuning for medical domain classification on 50k instruction pairs.

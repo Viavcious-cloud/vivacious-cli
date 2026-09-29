@@ -1,0 +1,23 @@
+name: 💬 Question & Help
+description: Ask a question about Vivacious Cloud, CLI usage, pricing, or dataset preparation
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about Vivacious Cloud ([vivaciouscloud.com](https://vivaciouscloud.com))? We're here to help!
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+      description: What would you like help with?
+      placeholder: E.g., How do I format multi-turn conversational data in my .jsonl dataset?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: OS / CLI Environment
+      description: What operating system and CLI version are you running?
+      placeholder: Windows 11 PowerShell / Ubuntu 22.04 / macOS Sonoma
